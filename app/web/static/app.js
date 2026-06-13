@@ -8,10 +8,21 @@ const frameCounter = document.getElementById("frameCounter");
 const responseBox = document.getElementById("responseBox");
 const previewCanvas = document.getElementById("previewCanvas");
 const previewCtx = previewCanvas.getContext("2d");
+const videoControls = document.getElementById("videoControls");
+const prevFrameBtn = document.getElementById("prevFrameBtn");
+const playPauseBtn = document.getElementById("playPauseBtn");
+const nextFrameBtn = document.getElementById("nextFrameBtn");
+const frameSlider = document.getElementById("frameSlider");
+const playbackState = document.getElementById("playbackState");
 
 let isProcessing = false;
+let currentVideoResult = null;
+let currentVideoFrames = [];
+let currentVideoFrameIndex = 0;
+let playbackTimer = null;
 
 processBtn.disabled = true;
+resetVideoViewer();
 
 chooseMediaBtn.addEventListener("click", () => {
     mediaInput.click();
@@ -19,6 +30,12 @@ chooseMediaBtn.addEventListener("click", () => {
 
 mediaInput.addEventListener("change", () => {
     const mediaFile = mediaInput.files?.[0];
+    stopPlayback();
+    resetVideoViewer();
+    previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+    responseBox.textContent = "Нет данных";
+    frameCounter.textContent = "Кадр: -";
+
     if (!mediaFile) {
         selectedFileName.textContent = "Файл не выбран";
         processBtn.disabled = true;
@@ -28,11 +45,11 @@ mediaInput.addEventListener("change", () => {
 
     const mediaKind = detectMediaKind(mediaFile);
     const sizeMb = (mediaFile.size / 1024 / 1024).toFixed(1);
-    selectedFileName.textContent = `Выбран файл: ${mediaFile.name} · ${sizeMb} МБ`;
+    selectedFileName.textContent = `${mediaFile.name} · ${sizeMb} МБ`;
     processBtn.disabled = mediaKind === "unknown";
 
     if (mediaKind === "video") {
-        setStatus("Видео будет обработано на backend через OpenCV", "idle");
+        setStatus("Видео будет обработано на backend, затем кадры можно листать", "idle");
     } else if (mediaKind === "image") {
         setStatus("Файл выбран, нажмите «Запустить обработку»", "idle");
     } else {
@@ -42,6 +59,29 @@ mediaInput.addEventListener("change", () => {
 
 processBtn.addEventListener("click", () => {
     void processMedia();
+});
+
+prevFrameBtn.addEventListener("click", () => {
+    stopPlayback();
+    void renderVideoFrame(currentVideoFrameIndex - 1);
+});
+
+nextFrameBtn.addEventListener("click", () => {
+    stopPlayback();
+    void renderVideoFrame(currentVideoFrameIndex + 1);
+});
+
+playPauseBtn.addEventListener("click", () => {
+    if (playbackTimer) {
+        stopPlayback();
+    } else {
+        startPlayback();
+    }
+});
+
+frameSlider.addEventListener("input", () => {
+    stopPlayback();
+    void renderVideoFrame(Number(frameSlider.value));
 });
 
 async function processMedia() {
@@ -58,6 +98,7 @@ async function processMedia() {
     isProcessing = true;
     processBtn.disabled = true;
     responseBox.textContent = "Обработка...";
+    stopPlayback();
 
     try {
         const mediaKind = detectMediaKind(mediaFile);
@@ -79,6 +120,7 @@ async function processMedia() {
 }
 
 async function processImage(imageFile) {
+    resetVideoViewer();
     setStatus("Отправка изображения на backend", "busy");
     const result = await sendFrame(imageFile, 0);
     await drawFrameAndMasks(result);
@@ -87,12 +129,13 @@ async function processImage(imageFile) {
     const doneStatus = result.violation_detected
         ? "Изображение обработано, нарушение найдено"
         : "Изображение обработано";
-    setStatus(doneStatus, "done");
+    setStatus(doneStatus, result.violation_detected ? "done-warning" : "done");
 }
 
 async function processVideo(videoFile) {
     const sampleFps = normalizeFps(Number(sampleFpsInput.value));
 
+    resetVideoViewer();
     setStatus("Загрузка видео на backend", "busy");
     frameCounter.textContent = "Кадр: -";
 
@@ -102,18 +145,16 @@ async function processVideo(videoFile) {
         throw new Error("Backend не вернул обработанные кадры");
     }
 
-    for (let index = 0; index < frames.length; index += 1) {
-        const frameResult = frames[index];
-        await drawFrameAndMasks(frameResult);
-        frameCounter.textContent = `Кадр: ${frameResult.frame_index}`;
-        responseBox.textContent = formatVideoResponse(result, frameResult);
-        await nextAnimationFrame();
-    }
+    currentVideoResult = result;
+    currentVideoFrames = frames;
+    currentVideoFrameIndex = 0;
+    setupVideoViewer(result, frames);
+    await renderVideoFrame(0);
 
     const violationCount = frames.filter((frame) => frame.violation_detected).length;
     const truncatedText = result.truncated ? " Лимит кадров достигнут." : "";
     setStatus(
-        `Видео обработано: ${frames.length} кадров, нарушений: ${violationCount}.${truncatedText}`,
+        `Видео обработано: ${frames.length} кадров, нарушений: ${violationCount}.${truncatedText} Можно листать кадры ниже.`,
         violationCount > 0 ? "done-warning" : "done",
     );
 }
@@ -155,6 +196,116 @@ async function sendVideo(videoFile, sampleFps) {
     return response.json();
 }
 
+function setupVideoViewer(videoResult, frames) {
+    currentVideoResult = videoResult;
+    currentVideoFrames = frames;
+    currentVideoFrameIndex = 0;
+
+    videoControls.hidden = false;
+    frameSlider.min = "0";
+    frameSlider.max = String(Math.max(frames.length - 1, 0));
+    frameSlider.value = "0";
+
+    updatePlaybackControls();
+}
+
+function resetVideoViewer() {
+    currentVideoResult = null;
+    currentVideoFrames = [];
+    currentVideoFrameIndex = 0;
+    stopPlayback();
+
+    if (videoControls) {
+        videoControls.hidden = true;
+    }
+    if (frameSlider) {
+        frameSlider.min = "0";
+        frameSlider.max = "0";
+        frameSlider.value = "0";
+    }
+    if (playbackState) {
+        playbackState.textContent = "0 / 0";
+    }
+    updatePlaybackControls();
+}
+
+async function renderVideoFrame(index) {
+    if (!currentVideoFrames.length || !currentVideoResult) {
+        return;
+    }
+
+    const safeIndex = clamp(Math.round(index), 0, currentVideoFrames.length - 1);
+    const frameResult = currentVideoFrames[safeIndex];
+    currentVideoFrameIndex = safeIndex;
+
+    await drawFrameAndMasks(frameResult);
+
+    const total = currentVideoFrames.length;
+    frameCounter.textContent = `Кадр: ${frameResult.frame_index} · ${safeIndex + 1}/${total}`;
+    responseBox.textContent = formatVideoResponse(currentVideoResult, frameResult, safeIndex);
+    frameSlider.value = String(safeIndex);
+    updatePlaybackControls();
+}
+
+function startPlayback() {
+    if (!currentVideoFrames.length || playbackTimer) {
+        return;
+    }
+
+    if (currentVideoFrameIndex >= currentVideoFrames.length - 1) {
+        currentVideoFrameIndex = -1;
+    }
+
+    playPauseBtn.textContent = "Пауза";
+    const playbackFps = Math.min(8, normalizeFps(Number(sampleFpsInput.value)));
+    const delayMs = Math.max(120, Math.round(1000 / playbackFps));
+
+    playbackTimer = window.setInterval(() => {
+        if (currentVideoFrameIndex >= currentVideoFrames.length - 1) {
+            stopPlayback();
+            return;
+        }
+        void renderVideoFrame(currentVideoFrameIndex + 1);
+    }, delayMs);
+}
+
+function stopPlayback() {
+    if (playbackTimer) {
+        window.clearInterval(playbackTimer);
+        playbackTimer = null;
+    }
+    if (playPauseBtn) {
+        playPauseBtn.textContent = "Воспроизвести";
+    }
+}
+
+function updatePlaybackControls() {
+    const hasFrames = currentVideoFrames.length > 0;
+    const isFirstFrame = currentVideoFrameIndex <= 0;
+    const isLastFrame = currentVideoFrameIndex >= currentVideoFrames.length - 1;
+
+    if (prevFrameBtn) {
+        prevFrameBtn.disabled = !hasFrames || isFirstFrame;
+    }
+    if (nextFrameBtn) {
+        nextFrameBtn.disabled = !hasFrames || isLastFrame;
+    }
+    if (playPauseBtn) {
+        playPauseBtn.disabled = !hasFrames;
+        if (!playbackTimer) {
+            playPauseBtn.textContent = "Воспроизвести";
+        }
+    }
+    if (frameSlider) {
+        frameSlider.disabled = !hasFrames;
+    }
+    if (playbackState) {
+        playbackState.textContent = hasFrames
+            ? `${currentVideoFrameIndex + 1} / ${currentVideoFrames.length}`
+            : "0 / 0";
+    }
+}
+
 async function drawFrameAndMasks(result) {
     const image = await loadImage(result.frame_data_url);
 
@@ -189,7 +340,7 @@ function drawMaskPolygon(mask, width, height) {
 
     const color = getMaskColor(mask);
     previewCtx.save();
-    previewCtx.lineWidth = mask.class_id === 3 ? 4 : 3;
+    previewCtx.lineWidth = isCarMask(mask) ? 4 : 3;
     previewCtx.strokeStyle = color;
     previewCtx.fillStyle = `${color}2b`;
 
@@ -251,12 +402,13 @@ function drawViolationRegion(region, width, height) {
     previewCtx.restore();
 }
 
-function formatVideoResponse(videoResult, frameResult) {
+function formatVideoResponse(videoResult, frameResult, framePosition = 0) {
     const lines = [
         `video: ${videoResult.filename}`,
         `source_fps: ${videoResult.source_fps ?? "-"}`,
         `sample_fps: ${videoResult.sample_fps}`,
         `frames_processed: ${videoResult.frames_processed}`,
+        `frame_position: ${framePosition + 1}/${currentVideoFrames.length || videoResult.frames_processed}`,
         `truncated: ${videoResult.truncated}`,
         "",
         "Текущий кадр:",
@@ -340,22 +492,24 @@ function loadImage(src) {
     });
 }
 
-function nextAnimationFrame() {
-    return new Promise((resolve) => requestAnimationFrame(resolve));
-}
-
 function getMaskColor(mask) {
     const className = String(mask.class_name || "").toLowerCase();
-    if (mask.class_id === 0 || className.includes("track")) {
-        return "#0aa58f";
+    if (mask.class_id === 0 || className.includes("track") || className.includes("road")) {
+        return "#00b894";
     }
     if (mask.class_id === 1 || className.includes("wheel")) {
-        return "#f1613f";
+        return "#ffb000";
     }
-    if (mask.class_id === 3 || className.includes("car")) {
-        return "#2f80ed";
+    if (isCarMask(mask)) {
+        return "#00a8ff";
     }
-    return "#9b51e0";
+    return "#a29bfe";
+}
+
+function isCarMask(mask) {
+    const className = String(mask.class_name || "").toLowerCase();
+    const modelName = String(mask.model_name || "").toLowerCase();
+    return mask.class_id === 3 || className.includes("car") || modelName.includes("car");
 }
 
 function clamp(value, min, max) {
