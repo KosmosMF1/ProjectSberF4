@@ -83,6 +83,9 @@ class VideoInferenceResponse(BaseModel):
     frames_processed: int
     total_frames_estimate: int | None
     truncated: bool
+    static_track_enabled: bool = False
+    static_track_reference_frame: int | None = None
+    static_track_reason: str | None = None
     results: list[ViolationAnalysisResponse]
 
 

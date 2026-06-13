@@ -12,14 +12,15 @@ except ImportError:  # pragma: no cover - optional CV dependency
 
 load_dotenv()
 
+DEFAULT_CAR_MODEL_PATH = "./app/models/best_cars.pt"
+
 
 class CarSegmentationService:
     """Adapter for a YOLO detection/segmentation model that predicts the whole car.
 
-    The uploaded `best_cars.pt` is a YOLO segmentation checkpoint with one class:
-    `cars`. The service also works with a detection-only YOLO model: if masks are
-    absent, it converts the bounding box into a rectangle polygon so the existing
-    frontend renderer can draw it.
+    The `best_cars.pt` checkpoint may be a detection or segmentation model. If
+    masks are absent, the service converts the bounding box into a rectangle
+    polygon so the existing frontend renderer can still draw cars.
     """
 
     def __init__(
@@ -29,8 +30,10 @@ class CarSegmentationService:
         iou: float | None = None,
         class_names: set[str] | None = None,
     ) -> None:
-        self.model_path = model_path or os.getenv("CAR_MODEL_PATH", "")
-        self.conf = float(conf if conf is not None else os.getenv("CAR_MODEL_CONF", "0.25"))
+        env_model_path = os.getenv("CAR_MODEL_PATH")
+        self.model_path = model_path or env_model_path or DEFAULT_CAR_MODEL_PATH
+        self.model_path_is_explicit = bool(model_path or env_model_path)
+        self.conf = float(conf if conf is not None else os.getenv("CAR_MODEL_CONF", "0.15"))
         self.iou = float(iou if iou is not None else os.getenv("CAR_MODEL_IOU", "0.7"))
         env_class_names = os.getenv("CAR_CLASS_NAMES", "car,cars,vehicle,formula,formula4")
         self.class_names = class_names or {
@@ -41,10 +44,14 @@ class CarSegmentationService:
         self._model = None
 
     def _load_model(self):
-        if not self.model_path or YOLO is None:
+        if YOLO is None:
+            return None
+        if not self.model_path:
             return None
         if not os.path.exists(self.model_path):
-            raise RuntimeError(f"CAR_MODEL_PATH does not exist: {self.model_path}")
+            if self.model_path_is_explicit:
+                raise RuntimeError(f"CAR_MODEL_PATH does not exist: {self.model_path}")
+            return None
         if self._model is None:
             self._model = YOLO(self.model_path)
         return self._model

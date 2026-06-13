@@ -2,6 +2,8 @@ const mediaInput = document.getElementById("mediaInput");
 const chooseMediaBtn = document.getElementById("chooseMediaBtn");
 const selectedFileName = document.getElementById("selectedFileName");
 const sampleFpsInput = document.getElementById("sampleFps");
+const staticTrackModeInput = document.getElementById("staticTrackMode");
+const trackReferenceFramesInput = document.getElementById("trackReferenceFrames");
 const processBtn = document.getElementById("processBtn");
 const statusBadge = document.getElementById("statusBadge");
 const frameCounter = document.getElementById("frameCounter");
@@ -134,12 +136,19 @@ async function processImage(imageFile) {
 
 async function processVideo(videoFile) {
     const sampleFps = normalizeFps(Number(sampleFpsInput.value));
+    const staticTrackMode = Boolean(staticTrackModeInput?.checked);
+    const referenceFrames = normalizeReferenceFrames(Number(trackReferenceFramesInput.value));
 
     resetVideoViewer();
-    setStatus("Загрузка видео на backend", "busy");
+    setStatus(
+        staticTrackMode
+            ? "Загрузка видео на backend и подбор фиксированной маски трассы"
+            : "Загрузка видео на backend",
+        "busy",
+    );
     frameCounter.textContent = "Кадр: -";
 
-    const result = await sendVideo(videoFile, sampleFps);
+    const result = await sendVideo(videoFile, sampleFps, staticTrackMode, referenceFrames);
     const frames = result.results || [];
     if (!frames.length) {
         throw new Error("Backend не вернул обработанные кадры");
@@ -152,9 +161,13 @@ async function processVideo(videoFile) {
     await renderVideoFrame(0);
 
     const violationCount = frames.filter((frame) => frame.violation_detected).length;
+    const carCount = countMasks(frames, isCarMask);
     const truncatedText = result.truncated ? " Лимит кадров достигнут." : "";
+    const staticTrackText = result.static_track_enabled
+        ? ` Фиксированная трасса: кадр ${result.static_track_reference_frame}.`
+        : "";
     setStatus(
-        `Видео обработано: ${frames.length} кадров, нарушений: ${violationCount}.${truncatedText} Можно листать кадры ниже.`,
+        `Видео обработано: ${frames.length} кадров, нарушений: ${violationCount}, машин: ${carCount}.${staticTrackText}${truncatedText}`,
         violationCount > 0 ? "done-warning" : "done",
     );
 }
@@ -177,11 +190,13 @@ async function sendFrame(frameBlob, frameIndex) {
     return response.json();
 }
 
-async function sendVideo(videoFile, sampleFps) {
+async function sendVideo(videoFile, sampleFps, staticTrackMode, referenceFrames) {
     const formData = new FormData();
     formData.append("video", videoFile, videoFile.name || "video.mp4");
     formData.append("sample_fps", String(sampleFps));
     formData.append("max_frames", "120");
+    formData.append("static_track_mode", String(staticTrackMode));
+    formData.append("track_reference_frames", String(referenceFrames));
 
     const response = await fetch("/api/infer/video", {
         method: "POST",
@@ -314,8 +329,13 @@ async function drawFrameAndMasks(result) {
     previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
     previewCtx.drawImage(image, 0, 0, previewCanvas.width, previewCanvas.height);
 
-    for (const mask of result.masks || []) {
+    const masks = result.masks || [];
+    for (const mask of masks.filter((item) => !isCarMask(item))) {
         drawMaskPolygon(mask, previewCanvas.width, previewCanvas.height);
+    }
+    for (const mask of masks.filter(isCarMask)) {
+        drawMaskPolygon(mask, previewCanvas.width, previewCanvas.height);
+        drawBoundingBox(mask, previewCanvas.width, previewCanvas.height);
     }
 
     if (result.violation_detected) {
@@ -342,7 +362,7 @@ function drawMaskPolygon(mask, width, height) {
     previewCtx.save();
     previewCtx.lineWidth = isCarMask(mask) ? 4 : 3;
     previewCtx.strokeStyle = color;
-    previewCtx.fillStyle = `${color}2b`;
+    previewCtx.fillStyle = `${color}${isCarMask(mask) ? "1f" : "2b"}`;
 
     previewCtx.beginPath();
     previewCtx.moveTo(points[0][0] * width, points[0][1] * height);
@@ -353,7 +373,7 @@ function drawMaskPolygon(mask, width, height) {
     previewCtx.fill();
     previewCtx.stroke();
 
-    const labelX = clamp(points[0][0] * width + 8, 8, width - 160);
+    const labelX = clamp(points[0][0] * width + 8, 8, width - 180);
     const labelY = clamp(points[0][1] * height - 10, 18, height - 8);
     const confidence = Number.isFinite(mask.confidence)
         ? ` ${(mask.confidence * 100).toFixed(0)}%`
@@ -365,6 +385,19 @@ function drawMaskPolygon(mask, width, height) {
     previewCtx.strokeText(`${mask.class_name}${confidence}`, labelX, labelY);
     previewCtx.fillStyle = color;
     previewCtx.fillText(`${mask.class_name}${confidence}`, labelX, labelY);
+    previewCtx.restore();
+}
+
+function drawBoundingBox(mask, width, height) {
+    if (!mask.bbox_xyxy || mask.bbox_xyxy.length < 4) {
+        return;
+    }
+    const [x1, y1, x2, y2] = mask.bbox_xyxy;
+    previewCtx.save();
+    previewCtx.strokeStyle = getMaskColor(mask);
+    previewCtx.lineWidth = 4;
+    previewCtx.setLineDash([10, 6]);
+    previewCtx.strokeRect(x1 * width, y1 * height, (x2 - x1) * width, (y2 - y1) * height);
     previewCtx.restore();
 }
 
@@ -410,6 +443,9 @@ function formatVideoResponse(videoResult, frameResult, framePosition = 0) {
         `frames_processed: ${videoResult.frames_processed}`,
         `frame_position: ${framePosition + 1}/${currentVideoFrames.length || videoResult.frames_processed}`,
         `truncated: ${videoResult.truncated}`,
+        `static_track_enabled: ${videoResult.static_track_enabled}`,
+        `static_track_reference_frame: ${videoResult.static_track_reference_frame ?? "-"}`,
+        `static_track_reason: ${videoResult.static_track_reason || "-"}`,
         "",
         "Текущий кадр:",
         formatResponse(frameResult),
@@ -418,9 +454,18 @@ function formatVideoResponse(videoResult, frameResult, framePosition = 0) {
 }
 
 function formatResponse(result) {
+    const masks = result.masks || [];
+    const trackCount = masks.filter((mask) => mask.class_id === 0).length;
+    const wheelCount = masks.filter((mask) => mask.class_id === 1 || String(mask.class_name || "").toLowerCase().includes("wheel")).length;
+    const carCount = masks.filter(isCarMask).length;
+
     const lines = [
         `frame_index: ${result.frame_index}`,
         `resolution: ${result.frame_width}x${result.frame_height}`,
+        `masks_total: ${masks.length}`,
+        `track_masks: ${trackCount}`,
+        `wheel_masks: ${wheelCount}`,
+        `car_masks: ${carCount}`,
         "",
     ];
 
@@ -439,11 +484,14 @@ function formatResponse(result) {
         lines.push("");
     }
 
-    for (const mask of result.masks || []) {
+    for (const mask of masks) {
         lines.push(`model: ${mask.model_name}`);
         lines.push(`class: ${mask.class_id} (${mask.class_name})`);
         if (Number.isFinite(mask.confidence)) {
             lines.push(`confidence: ${Number(mask.confidence || 0).toFixed(4)}`);
+        }
+        if (mask.source_frame_index !== undefined) {
+            lines.push(`source_frame_index: ${mask.source_frame_index}`);
         }
         if (mask.bbox_xyxy) {
             lines.push(`bbox_xyxy: ${mask.bbox_xyxy}`);
@@ -454,11 +502,22 @@ function formatResponse(result) {
     return lines.join("\n");
 }
 
+function countMasks(frames, predicate) {
+    return frames.reduce((total, frame) => total + (frame.masks || []).filter(predicate).length, 0);
+}
+
 function normalizeFps(value) {
     if (!Number.isFinite(value)) {
         return 2;
     }
     return Math.min(15, Math.max(0.5, value));
+}
+
+function normalizeReferenceFrames(value) {
+    if (!Number.isFinite(value)) {
+        return 30;
+    }
+    return Math.min(120, Math.max(1, Math.round(value)));
 }
 
 function detectMediaKind(file) {

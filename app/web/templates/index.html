@@ -16,11 +16,12 @@
     <main class="layout">
         <section class="hero-panel">
             <div class="hero-copy">
-                <p class="eyebrow">Formula 4 · AI marshal dashboard</p>
-                <h1>Контроль выезда автомобиля за пределы трассы</h1>
+                <p class="eyebrow">Formula 4 · fixed camera AI marshal</p>
+                <h1>Контроль выезда за пределы трассы</h1>
                 <p class="subtitle">
-                    Загрузите изображение или видео. Backend извлечёт кадры через OpenCV,
-                    запустит модели трассы, колёс и автомобиля, а результат можно будет спокойно просмотреть покадрово.
+                    Для видео со статичной судейской камеры можно зафиксировать маску трассы по одному
+                    наименее закрытому кадру, а затем применять её ко всем последующим кадрам.
+                    Это уменьшает скачки разметки, когда болиды перекрывают асфальт.
                 </p>
             </div>
 
@@ -33,10 +34,26 @@
                 </div>
 
                 <label class="control-card fps-control" for="sampleFps">
-                    <span class="control-label">FPS выборки видео</span>
+                    <span class="control-label">FPS выборки</span>
                     <input id="sampleFps" type="number" min="0.5" max="15" step="0.5" value="2" />
-                    <span class="control-hint">Сколько кадров в секунду отправлять на анализ</span>
+                    <span class="control-hint">Сколько кадров в секунду анализировать</span>
                 </label>
+
+                <div class="control-card fixed-track-card">
+                    <span class="control-label">Трасса</span>
+                    <label class="switch-row" for="staticTrackMode">
+                        <input id="staticTrackMode" type="checkbox" checked />
+                        <span>
+                            <strong>Фиксированная маска</strong>
+                            <small>лучше для статичной камеры</small>
+                        </span>
+                    </label>
+                    <label class="mini-input-row" for="trackReferenceFrames">
+                        <span>Искать среди первых</span>
+                        <input id="trackReferenceFrames" type="number" min="1" max="120" step="1" value="30" />
+                        <span>кадров</span>
+                    </label>
+                </div>
 
                 <button id="processBtn" class="primary-action" type="button">Запустить обработку</button>
             </div>
@@ -60,7 +77,7 @@
                     <p class="section-kicker">Processed frame</p>
                     <h2>Кадр и найденные области</h2>
                 </div>
-                <p>Маски рисуются поверх исходного кадра.</p>
+                <p>Маски рисуются поверх исходного кадра. Для видео доступен покадровый просмотр.</p>
             </div>
 
             <div class="preview-viewport">
@@ -87,7 +104,7 @@
                     <p class="section-kicker">Backend response</p>
                     <h2>Диагностика</h2>
                 </div>
-                <p>Данные текущего кадра.</p>
+                <p>Данные текущего кадра и сводка по видео.</p>
             </div>
             <pre id="responseBox">Нет данных</pre>
         </section>
