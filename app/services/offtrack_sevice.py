@@ -1,21 +1,19 @@
+from typing import Any
+
 import cv2
 import numpy as np
-from typing import Any
-from app.schemas import OfftrackAnalysisResult, WheelOfftrackDetail
+
+from app.schemas import CarTrackLimits, OfftrackAnalysisResult, WheelOfftrackDetail
+from app.services.car_tracking import assign_wheels, box_for
+
 
 class OfftrackDetector:
-    """
-    Core logic:
-    - build a binary track mask from the track polygon;
-    - convert each wheel polygon to a binary mask;
-    - compute how much of every wheel lies outside the track;
-    - flag a violation if the ratio crosses a threshold.
-    """
+    """Evaluate four distinct wheel masks belonging to the same car."""
 
     def __init__(
         self,
         offtrack_threshold: float = 0.12,
-        hard_violation_threshold: float = 0.25,
+        hard_violation_threshold: float = 0.8,
         boundary_tolerance_px: int = 4,
     ) -> None:
         self.offtrack_threshold = offtrack_threshold
@@ -24,125 +22,114 @@ class OfftrackDetector:
 
     @staticmethod
     def _to_abs_polygon(points: list[list[float]], width: int, height: int) -> np.ndarray:
-        poly = np.asarray(points, dtype=np.float32)
-        if poly.size == 0:
-            return poly
-        # If points look normalized, convert to absolute pixels.
-        if np.nanmax(poly) <= 1.5:
-            poly[:, 0] *= width
-            poly[:, 1] *= height
+        poly = np.array(points, dtype=np.float32).reshape(-1, 2)
+        if poly.size and np.nanmax(poly) <= 1.5:
+            poly *= [width, height]
         return np.round(poly).astype(np.int32)
 
-    @staticmethod
-    def _polygon_mask(shape_hw: tuple[int, int], polygon_px: np.ndarray) -> np.ndarray:
-        mask = np.zeros(shape_hw, dtype=np.uint8)
-        if polygon_px.size == 0 or len(polygon_px) < 3:
-            return mask.astype(bool)
-        cv2.fillPoly(mask, [polygon_px.reshape(-1, 1, 2)], 1)
-        return mask.astype(bool)
-
-    @staticmethod
-    def _mask_to_overlay(frame_bgr: np.ndarray, mask: np.ndarray, color_bgr: tuple[int, int, int], alpha: float) -> np.ndarray:
-        overlay = frame_bgr.copy()
-        colored = np.zeros_like(frame_bgr)
-        colored[:, :] = np.array(color_bgr, dtype=np.uint8)
-        overlay[mask] = cv2.addWeighted(frame_bgr[mask], 1.0 - alpha, colored[mask], alpha, 0)
-        return overlay
+    def track_masks(
+        self, shape: tuple[int, int], points: list[list[float]]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        height, width = shape
+        track = np.zeros(shape, dtype=np.uint8)
+        cv2.fillPoly(track, [self._to_abs_polygon(points, width, height)], 1)
+        size = max(1, self.boundary_tolerance_px * 2 + 1)
+        tolerant = cv2.dilate(track, np.ones((size, size), np.uint8))
+        return track, tolerant
 
     def analyze(
         self,
         frame_bgr: np.ndarray,
         track_points: list[list[float]] | None,
         wheel_masks: list[dict[str, Any]],
+        car_masks: list[dict[str, Any]],
+        *,
+        track_masks: tuple[np.ndarray, np.ndarray] | None = None,
+        annotate: bool = True,
     ) -> OfftrackAnalysisResult:
-        if not track_points:
-            return OfftrackAnalysisResult(
-                violation_detected=False,
-                violation_score=0.0,
-                reason="",
-                offtrack_wheels=None,
-                annotated_frame_bgr=None,
-                track_mask=None,
-                violation_mask=None,
-            )
         height, width = frame_bgr.shape[:2]
-        track_poly = self._to_abs_polygon(track_points, width, height)
-        track_mask = self._polygon_mask((height, width), track_poly)
+        track, tolerant = track_masks or (None, None)
+        if tolerant is None and track_points and len(track_points) >= 3:
+            track, tolerant = self.track_masks((height, width), track_points)
 
-        # Tolerance band to reduce false positives from boundary jaggedness.
-        kernel_size = max(1, int(self.boundary_tolerance_px) * 2 + 1)
-        kernel = np.ones((kernel_size, kernel_size), np.uint8)
-        track_mask_tolerant = cv2.dilate(track_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-
-        violation_mask = np.zeros((height, width), dtype=bool)
-        details: list[WheelOfftrackDetail] = []
-        violation_score = 0.0
-        hard_violation = False
-
-        for idx, wheel in enumerate(wheel_masks):
-            poly_points = wheel.get("points", [])
-            poly_px = self._to_abs_polygon(poly_points, width, height)
-            wheel_mask = self._polygon_mask((height, width), poly_px)
-            total_pixels = int(wheel_mask.sum())
-            if total_pixels == 0:
-                continue
-
-            outside_mask = wheel_mask & (~track_mask_tolerant)
-            outside_pixels = int(outside_mask.sum())
-            outside_ratio = outside_pixels / float(total_pixels)
-
-            details.append(
-                WheelOfftrackDetail(
-                    instance_id=int(wheel.get("instance_id", idx)),
-                    outside_ratio=float(outside_ratio),
-                    outside_pixels=outside_pixels,
-                    total_pixels=total_pixels,
+        details: dict[int, WheelOfftrackDetail] = {}
+        outside_regions: dict[int, tuple[int, int, np.ndarray]] = {}
+        if tolerant is not None:
+            for index, wheel in enumerate(wheel_masks):
+                polygon = self._to_abs_polygon(wheel["points"], width, height)
+                x, y, w, h = cv2.boundingRect(polygon)
+                left, top = max(0, x), max(0, y)
+                right, bottom = min(width, x + w), min(height, y + h)
+                if right <= left or bottom <= top:
+                    continue
+                roi = np.zeros((bottom - top, right - left), dtype=np.uint8)
+                cv2.fillPoly(roi, [polygon - [left, top]], 1)
+                total = cv2.countNonZero(roi)
+                if not total:
+                    continue
+                outside = roi & (1 - tolerant[top:bottom, left:right])
+                count = cv2.countNonZero(outside)
+                details[index] = WheelOfftrackDetail(
+                    instance_id=index, outside_ratio=count / total,
+                    outside_pixels=count, total_pixels=total,
                 )
-            )
+                outside_regions[index] = left, top, outside
 
-            violation_mask |= outside_mask
-            violation_score = max(violation_score, outside_ratio)
+        cars = []
+        for car, indices in zip(car_masks, assign_wheels(car_masks, wheel_masks), strict=True):
+            scores = [details[index].outside_ratio for index in indices if index in details]
+            wheels_beyond_edge = sum(score >= self.offtrack_threshold for score in scores)
+            if len(scores) == 4 and min(scores) >= self.hard_violation_threshold:
+                status = "outside"
+            elif 0 < wheels_beyond_edge < len(scores):
+                status = "partial"
+            elif len(scores) == 4 and wheels_beyond_edge == 0:
+                status = "inside"
+            else:
+                status = "unknown"
+            cars.append(CarTrackLimits(
+                track_id=car.get("track_id"), bbox_xyxy=box_for(car), status=status,
+                wheel_ids=indices, wheels_outside=wheels_beyond_edge,
+            ))
 
-            if outside_ratio >= self.hard_violation_threshold:
-                hard_violation = True
+        confirmed = [car for car in cars if car.status == "outside"]
+        score = max(
+            (min(details[index].outside_ratio for index in car.wheel_ids) for car in confirmed),
+            default=0.0,
+        )
+        violation_mask = None
+        annotated = None
+        if track is not None and (confirmed or annotate):
+            violation_mask = np.zeros((height, width), dtype=np.uint8)
+            for car in confirmed:
+                for index in car.wheel_ids:
+                    x, y, region = outside_regions[index]
+                    h, w = region.shape
+                    violation_mask[y:y+h, x:x+w] |= region
+        if annotate and track is not None:
+            annotated = frame_bgr.copy()
+            track_pixels = track.astype(bool)
+            annotated[track_pixels] = annotated[track_pixels] * 0.82 + np.array([0, 180, 0]) * 0.18
+            annotated[violation_mask.astype(bool)] = (0, 0, 255)
+            if track_points:
+                cv2.polylines(annotated, [self._to_abs_polygon(track_points, width, height)],
+                              True, (0, 255, 255), 3)
+            for wheel in wheel_masks:
+                cv2.polylines(annotated, [self._to_abs_polygon(wheel["points"], width, height)],
+                              True, (255, 255, 255), 2)
 
-        violation_detected = any(d.outside_ratio >= self.offtrack_threshold for d in details)
-        if hard_violation:
-            violation_detected = True
-
-        if not details:
-            reason = "wheel masks were not found"
-        elif violation_detected:
-            reason = "at least one wheel has crossed the track boundary"
+        if confirmed:
+            reason = "four wheels of the same car are outside the track boundary"
+        elif not cars or tolerant is None or not details or any(car.status == "unknown" for car in cars):
+            reason = "insufficient evidence to determine the position of all wheels"
         else:
-            reason = "all wheels are inside the track boundary"
-
-        annotated = frame_bgr.copy()
-
-        # Track overlay in green.
-        annotated = self._mask_to_overlay(annotated, track_mask, (0, 180, 0), alpha=0.18)
-
-        # Highlight violation pixels in red.
-        if violation_mask.any():
-            annotated = self._mask_to_overlay(annotated, violation_mask, (0, 0, 255), alpha=0.65)
-
-        # Draw track border.
-        if len(track_poly) >= 3:
-            cv2.polylines(annotated, [track_poly.reshape(-1, 1, 2)], isClosed=True, color=(0, 255, 255), thickness=3)
-
-        # Draw wheel contours.
-        for wheel in wheel_masks:
-            poly_points = wheel.get("points", [])
-            poly_px = self._to_abs_polygon(poly_points, width, height)
-            if len(poly_px) >= 3:
-                cv2.polylines(annotated, [poly_px.reshape(-1, 1, 2)], isClosed=True, color=(255, 255, 255), thickness=2)
+            reason = "no car has four wheels outside the track boundary"
 
         return OfftrackAnalysisResult(
-            violation_detected=violation_detected,
-            violation_score=float(violation_score),
-            reason=reason,
-            offtrack_wheels=details,
+            violation_detected=bool(confirmed), violation_score=score, reason=reason,
+            offtrack_wheels=list(details.values()) or None,
             annotated_frame_bgr=annotated,
-            track_mask=track_mask,
-            violation_mask=violation_mask,
+            track_mask=track.astype(bool) if annotate and track is not None else None,
+            violation_mask=violation_mask.astype(bool) if violation_mask is not None else None,
+            cars=cars,
         )

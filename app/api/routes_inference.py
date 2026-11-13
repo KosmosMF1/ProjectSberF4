@@ -1,16 +1,22 @@
 import base64
 import math
 import os
+import shutil
 import tempfile
+from collections.abc import Iterator
+from itertools import islice
 from pathlib import Path
 from typing import Annotated, Any
+from uuid import UUID, uuid4
 
 import cv2
 import numpy as np
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 
 from app.schemas import (
     FrameInferenceResponse,
+    OfftrackAnalysisResult,
     VideoInferenceResponse,
     ViolationAnalysisResponse,
     ViolationRegion,
@@ -24,6 +30,9 @@ from app.services import (
     encode_bgr_to_data_url,
     encode_mask_to_data_url,
 )
+
+from app.services.car_tracking import CarTracker, unique_masks
+from app.services.incidents import INCIDENT_DIR, IncidentDetector, evidence_frame, write_incident
 
 router = APIRouter()
 
@@ -266,137 +275,96 @@ def _mask_to_violation_regions(
     return regions
 
 
-def _dump_response(response: ViolationAnalysisResponse) -> dict[str, Any]:
-    if hasattr(response, "model_dump"):
-        return response.model_dump()
-    return response.dict()
-
-
-def _build_violation_response(
-    frame_bgr: np.ndarray,
-    frame_index: int,
-    offtrack_threshold: float,
-    hard_violation_threshold: float,
-    track_payload_override: dict[str, Any] | None = None,
-) -> ViolationAnalysisResponse:
+def _validate_thresholds(offtrack_threshold: float, hard_violation_threshold: float) -> None:
     if hard_violation_threshold < offtrack_threshold:
         raise HTTPException(
             status_code=422,
-            detail=(
-                "hard_violation_threshold must be greater than or equal "
-                "to offtrack_threshold"
-            ),
+            detail="hard_violation_threshold must be greater than or equal to offtrack_threshold",
         )
 
-    detector = OfftrackDetector(
-        offtrack_threshold=offtrack_threshold,
-        hard_violation_threshold=hard_violation_threshold,
-    )
 
-    all_masks: list[dict[str, Any]] = []
+def _analyze_frame(
+    frame: np.ndarray,
+    index: int,
+    detector: OfftrackDetector,
+    track_override: dict[str, Any] | None = None,
+    cached_masks: tuple[np.ndarray, np.ndarray] | None = None,
+    tracker: CarTracker | None = None,
+    timestamp: float = 0.0,
+    annotate: bool = True,
+) -> tuple[OfftrackAnalysisResult, list[dict[str, Any]], list[dict[str, Any]], list[list[float]]]:
     try:
-        if track_payload_override is None:
-            track_payloads = track_service.build_track_mask_payload(frame_bgr, frame_index)
-            track_payload = _select_track_payload(track_payloads)
-        else:
-            track_payloads = [_clone_payload(track_payload_override)]
-            track_payload = track_payloads[0]
-
-        wheel_payloads = wheel_service.build_wheel_mask_payload(frame_bgr, frame_index)
-        car_payloads = car_service.build_car_mask_payload(frame_bgr, frame_index)
-        all_masks = [
-            *track_payloads,
-            *wheel_payloads,
-            *car_payloads,
-        ]
-
-        if track_payload and wheel_payloads:
-            analysis = detector.analyze(
-                frame_bgr=frame_bgr,
-                track_points=track_payload["points"],
-                wheel_masks=wheel_payloads,
-            )
-
-            violation_regions = _mask_to_violation_regions(
-                violation_mask=analysis.violation_mask,
-                violation_score=analysis.violation_score,
-            )
-            return ViolationAnalysisResponse(
-                frame_index=frame_index,
-                frame_width=int(frame_bgr.shape[1]),
-                frame_height=int(frame_bgr.shape[0]),
-                frame_data_url=encode_bgr_to_data_url(frame_bgr),
-                annotated_frame_data_url=encode_bgr_to_data_url(analysis.annotated_frame_bgr),
-                track_mask_data_url=encode_mask_to_data_url(analysis.track_mask),
-                violation_mask_data_url=encode_mask_to_data_url(analysis.violation_mask),
-                violation_detected=analysis.violation_detected,
-                violation_score=analysis.violation_score,
-                reason=analysis.reason,
-                offtrack_wheels=analysis.offtrack_wheels,
-                violation_regions=violation_regions,
-                masks=all_masks,
-            )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        track = track_override or _select_track_payload(track_service.build_track_mask_payload(frame, index))
+        wheels = unique_masks(
+            [mask for mask in wheel_service.build_wheel_mask_payload(frame, index)
+             if mask["model_name"] != "wheel_segmentation_stub"],
+            iou=0.45, containment=0.75,
+        )
+        cars = unique_masks(car_service.build_car_mask_payload(frame, index), iou=0.32, containment=0.8)
+        if tracker is not None:
+            cars = tracker.update(cars, timestamp)
+        points = track["points"] if track else []
+        analysis = detector.analyze(frame, points, wheels, cars, track_masks=cached_masks, annotate=annotate)
+        return analysis, ([track] if track else []) + wheels + cars, wheels, points
     except Exception as exc:
         raise HTTPException(
             status_code=503,
             detail=f"Model inference failed: {type(exc).__name__}: {exc}",
         ) from exc
 
+
+def _response(
+    frame: np.ndarray, index: int, analysis: OfftrackAnalysisResult,
+    masks: list[dict[str, Any]], source_index: int | None = None,
+    timestamp: float | None = None, compact: bool = False,
+) -> ViolationAnalysisResponse:
+    if compact and frame.shape[1] > 960:
+        height = round(frame.shape[0] * 960 / frame.shape[1])
+        frame = cv2.resize(frame, (960, max(1, height)), interpolation=cv2.INTER_AREA)
     return ViolationAnalysisResponse(
-        frame_index=frame_index,
-        frame_width=int(frame_bgr.shape[1]),
-        frame_height=int(frame_bgr.shape[0]),
-        frame_data_url=encode_bgr_to_data_url(frame_bgr),
-        annotated_frame_data_url="",
-        track_mask_data_url="",
-        violation_mask_data_url="",
-        violation_detected=False,
-        violation_score=0.0,
-        reason="track or wheel masks were not found",
-        offtrack_wheels=None,
-        violation_regions=None,
-        masks=all_masks,
+        frame_index=index,
+        source_frame_index=source_index,
+        timestamp=timestamp,
+        frame_width=frame.shape[1],
+        frame_height=frame.shape[0],
+        frame_data_url=encode_bgr_to_data_url(frame),
+        annotated_frame_data_url=(
+            encode_bgr_to_data_url(analysis.annotated_frame_bgr)
+            if analysis.annotated_frame_bgr is not None else ""
+        ),
+        track_mask_data_url=encode_mask_to_data_url(analysis.track_mask) if analysis.track_mask is not None else "",
+        violation_mask_data_url=(
+            encode_mask_to_data_url(analysis.violation_mask) if analysis.violation_mask is not None else ""
+        ),
+        violation_detected=analysis.violation_detected,
+        violation_score=analysis.violation_score,
+        reason=analysis.reason,
+        offtrack_wheels=analysis.offtrack_wheels,
+        violation_regions=(
+            _mask_to_violation_regions(analysis.violation_mask, analysis.violation_score)
+            if analysis.violation_detected and analysis.violation_mask is not None else []
+        ),
+        masks=masks,
+        cars=analysis.cars,
     )
 
 
 def _sample_video_frames(
-    capture: cv2.VideoCapture,
-    source_fps: float | None,
-    sample_fps: float,
-    max_frames: int,
-) -> tuple[list[SampledFrame], bool]:
-    target_interval = 1.0 / float(sample_fps)
-    next_sample_time = 0.0
-    raw_frame_index = 0
-    sampled_index = 0
-    sampled_frames: list[SampledFrame] = []
-    truncated = False
-
-    while True:
-        ok, frame_bgr = capture.read()
-        if not ok:
-            break
-
-        if source_fps:
-            current_time = raw_frame_index / source_fps
-        else:
-            current_time = sampled_index * target_interval
-
-        if current_time + 1e-9 >= next_sample_time:
-            _validate_frame_size(frame_bgr)
-            sampled_frames.append((sampled_index, frame_bgr.copy()))
-            sampled_index += 1
-            next_sample_time += target_interval
-
-            if len(sampled_frames) >= max_frames:
-                truncated = True
+    capture: cv2.VideoCapture, source_fps: float, sample_fps: float,
+) -> Iterator[tuple[int, float, np.ndarray]]:
+    interval = 1.0 / min(source_fps, sample_fps)
+    next_time = 0.0
+    source_index = 0
+    while capture.grab():
+        timestamp = source_index / source_fps
+        if timestamp + 1e-9 >= next_time:
+            ok, frame = capture.retrieve()
+            if not ok:
                 break
-
-        raw_frame_index += 1
-
-    return sampled_frames, truncated
+            _validate_frame_size(frame)
+            yield source_index, timestamp, frame
+            next_time += interval
+        source_index += 1
 
 
 @router.post("/infer/frame", response_model=FrameInferenceResponse)
@@ -425,115 +393,122 @@ async def infer_violation(
     frame: UploadFile = File(...),
     frame_index: Annotated[int, Form(ge=0)] = 0,
     offtrack_threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.12,
-    hard_violation_threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.25,
+    hard_violation_threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.8,
 ) -> ViolationAnalysisResponse:
+    _validate_thresholds(offtrack_threshold, hard_violation_threshold)
     frame_bgr = _decode_uploaded_frame(frame)
-    return _build_violation_response(
-        frame_bgr=frame_bgr,
-        frame_index=frame_index,
-        offtrack_threshold=offtrack_threshold,
-        hard_violation_threshold=hard_violation_threshold,
-    )
+    detector = OfftrackDetector(offtrack_threshold, hard_violation_threshold)
+    analysis, masks, _, _ = _analyze_frame(frame_bgr, frame_index, detector)
+    return _response(frame_bgr, frame_index, analysis, masks)
 
 
 @router.post("/infer/video", response_model=VideoInferenceResponse)
-async def infer_video(
+def infer_video(
     video: UploadFile = File(...),
     sample_fps: Annotated[float, Form(ge=0.1, le=30.0)] = 2.0,
     max_frames: Annotated[int, Form(ge=1, le=500)] = 120,
     offtrack_threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.12,
-    hard_violation_threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.25,
+    hard_violation_threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.8,
     static_track_mode: Annotated[bool, Form()] = True,
     track_reference_frames: Annotated[int, Form(ge=1, le=120)] = 30,
+    camera_id: Annotated[str, Form(min_length=1, max_length=48, pattern=r"^[A-Za-z0-9_-]+$")] = "camera-1",
+    compact: Annotated[bool, Form()] = False,
 ) -> VideoInferenceResponse:
-    """Decode video on backend and optionally reuse a static track mask.
+    """Analyze a recording and export one package for each confirmed excursion."""
+    _validate_thresholds(offtrack_threshold, hard_violation_threshold)
+    filename = video.filename or "video"
+    suffix = Path(filename).suffix
+    detector = OfftrackDetector(offtrack_threshold, hard_violation_threshold)
+    tracker = CarTracker()
+    incidents = []
+    run_id = uuid4()
 
-    For fixed judge cameras the road/track geometry should be stable. In static
-    mode the backend chooses one least-occluded reference frame and applies its
-    track mask to all sampled frames. This avoids frame-to-frame track mask jumps
-    caused by cars covering parts of the road.
-    """
-    video_bytes = _read_upload_bytes(video, MAX_VIDEO_UPLOAD_BYTES)
-    suffix = Path(video.filename or "upload.mp4").suffix or ".mp4"
+    with tempfile.TemporaryDirectory(prefix="track-limits-") as work:
+        source = str(Path(work) / f"source{suffix}")
+        total_bytes = 0
+        with open(source, "wb") as output:
+            while chunk := video.file.read(1024 * 1024):
+                total_bytes += len(chunk)
+                if total_bytes > MAX_VIDEO_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Uploaded video is too large")
+                output.write(chunk)
+        if not total_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
-    tmp_path = ""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-            tmp_file.write(video_bytes)
-            tmp_path = tmp_file.name
+        capture = cv2.VideoCapture(source)
+        try:
+            if not capture.isOpened():
+                raise HTTPException(status_code=400, detail="OpenCV could not open the uploaded video")
+            rate = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+            source_fps = rate if math.isfinite(rate) and rate > 0 else None
+            fps = source_fps or 30.0
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            incident_detector = IncidentDetector(min(fps, sample_fps))
+            static_track = None
+            if static_track_mode:
+                reference_count = min(track_reference_frames, max_frames)
+                stride = max(1, math.ceil(reference_count / 8))
+                frames = _sample_video_frames(capture, fps, sample_fps)
+                candidates = [
+                    (index, frame)
+                    for index, _, frame in islice(frames, 0, reference_count, stride)
+                ]
+                static_track = _select_static_track_payload(candidates, len(candidates))
+                del candidates, frames
+                capture.release()
+                capture = cv2.VideoCapture(source)
 
-        capture = cv2.VideoCapture(tmp_path)
-        if not capture.isOpened():
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "OpenCV could not open the uploaded video. "
-                    "Try converting it to MP4/H.264 if the codec is unsupported."
-                ),
-            )
-
-        source_fps_raw = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
-        source_fps = source_fps_raw if math.isfinite(source_fps_raw) and source_fps_raw > 0 else None
-        frame_count_raw = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        total_frames_estimate = frame_count_raw if frame_count_raw > 0 else None
-
-        sampled_frames, truncated = _sample_video_frames(
-            capture=capture,
-            source_fps=source_fps,
-            sample_fps=float(sample_fps),
-            max_frames=max_frames,
-        )
-        capture.release()
-
-        if not sampled_frames:
-            raise HTTPException(
-                status_code=400,
-                detail="No frames were decoded from the uploaded video",
-            )
-
-        static_track_payload = None
-        static_track_reason = "disabled"
-        if static_track_mode:
-            static_track_payload = _select_static_track_payload(
-                sampled_frames=sampled_frames,
-                reference_frames=min(track_reference_frames, len(sampled_frames)),
-            )
-            if static_track_payload:
-                static_track_reason = (
-                    "fixed track mask selected from frame "
-                    f"{static_track_payload.get('source_frame_index')} "
-                    f"with {static_track_payload.get('reference_dynamic_masks')} dynamic masks"
+            results = []
+            cached_masks = None
+            truncated = False
+            for index, (source_index, timestamp, frame) in enumerate(_sample_video_frames(capture, fps, sample_fps)):
+                if index == max_frames:
+                    truncated = True
+                    break
+                if static_track and (cached_masks is None or cached_masks[0].shape != frame.shape[:2]):
+                    cached_masks = detector.track_masks(frame.shape[:2], static_track["points"])
+                analysis, masks, wheels, points = _analyze_frame(
+                    frame, source_index, detector, static_track, cached_masks, tracker, timestamp,
+                    annotate=not compact,
                 )
-            else:
-                static_track_reason = "static mode requested, but no track mask was found in reference frames"
+                for incident in incident_detector.update(analysis.cars, source_index, timestamp):
+                    still = evidence_frame(frame, incident, camera_id, points, wheels)
+                    incidents.append(write_incident(
+                        Path(work), run_id, source, filename, fps, camera_id, incident, still,
+                    ))
+                results.append(_response(frame, index, analysis, masks, source_index, timestamp, compact))
+        finally:
+            capture.release()
 
-        results: list[ViolationAnalysisResponse] = []
-        for frame_index, frame_bgr in sampled_frames:
-            response = _build_violation_response(
-                frame_bgr=frame_bgr,
-                frame_index=frame_index,
-                offtrack_threshold=offtrack_threshold,
-                hard_violation_threshold=hard_violation_threshold,
-                track_payload_override=static_track_payload,
-            )
-            results.append(response)
+        if not results:
+            raise HTTPException(status_code=400, detail="No frames were decoded from the uploaded video")
+        if incidents:
+            INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=INCIDENT_DIR) as staging:
+                batch = Path(staging) / str(run_id)
+                batch.mkdir()
+                for incident in incidents:
+                    package = f"{incident.id}.zip"
+                    # The work directory and the configured output may be on different disks.
+                    shutil.copyfile(Path(work) / package, batch / package)
+                batch.rename(INCIDENT_DIR / str(run_id))
 
-        return VideoInferenceResponse(
-            filename=video.filename or "video",
-            source_fps=source_fps,
-            sample_fps=float(sample_fps),
-            frames_processed=len(results),
-            total_frames_estimate=total_frames_estimate,
-            truncated=truncated,
-            static_track_enabled=bool(static_track_payload),
-            static_track_reference_frame=(
-                int(static_track_payload["source_frame_index"])
-                if static_track_payload and "source_frame_index" in static_track_payload
-                else None
-            ),
-            static_track_reason=static_track_reason,
-            results=results,
-        )
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    if static_track:
+        reason = f"fixed track mask selected from source frame {static_track['source_frame_index']}"
+    else:
+        reason = "no reference track mask found" if static_track_mode else "disabled"
+    return VideoInferenceResponse(
+        filename=filename, source_fps=source_fps, sample_fps=sample_fps, frames_processed=len(results),
+        total_frames_estimate=frame_count if frame_count > 0 else None, truncated=truncated,
+        static_track_enabled=bool(static_track),
+        static_track_reference_frame=static_track["source_frame_index"] if static_track else None,
+        static_track_reason=reason, results=results, incidents=incidents,
+    )
+
+
+@router.get("/incidents/{run_id}/{incident_id}")
+def download_incident(run_id: UUID, incident_id: UUID) -> FileResponse:
+    package = INCIDENT_DIR / str(run_id) / f"{incident_id}.zip"
+    if not package.is_file():
+        raise HTTPException(status_code=404, detail="Incident package was not found")
+    return FileResponse(package, media_type="application/zip", filename=package.name)

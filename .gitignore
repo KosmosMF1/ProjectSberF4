@@ -249,3 +249,5 @@ uploads/
 *.mp4
 *.avi
 *.mkv
+
+/incidents/

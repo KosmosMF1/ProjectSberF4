@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -49,7 +49,7 @@ class FrameInferenceResponse(BaseModel):
 class ViolationAnalysisRequest(BaseModel):
     frame_index: int = Field(ge=0)
     offtrack_threshold: float = Field(default=0.12, ge=0.0, le=1.0)
-    hard_violation_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
+    hard_violation_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
     track_prompts: list[str] | None = None
 
 
@@ -58,6 +58,25 @@ class WheelOfftrackDetail(BaseModel):
     outside_ratio: float
     outside_pixels: int
     total_pixels: int
+
+
+class CarTrackLimits(BaseModel):
+    track_id: int | None = None
+    bbox_xyxy: tuple[float, float, float, float]
+    status: Literal["inside", "partial", "outside", "unknown"]
+    wheel_ids: list[int]
+    wheels_outside: int
+
+
+class IncidentSummary(BaseModel):
+    id: str
+    track_id: int
+    camera_id: str
+    start_frame: int
+    start_time: float
+    confirmed_frame: int
+    confirmed_time: float
+    download_url: str
 
 
 class ViolationAnalysisResponse(BaseModel):
@@ -74,6 +93,9 @@ class ViolationAnalysisResponse(BaseModel):
     offtrack_wheels: list[WheelOfftrackDetail] | None
     violation_regions: list[ViolationRegion] | None
     masks: list[dict[str, Any]]
+    cars: list[CarTrackLimits] = Field(default_factory=list)
+    source_frame_index: int | None = None
+    timestamp: float | None = None
 
 
 class VideoInferenceResponse(BaseModel):
@@ -87,6 +109,7 @@ class VideoInferenceResponse(BaseModel):
     static_track_reference_frame: int | None = None
     static_track_reason: str | None = None
     results: list[ViolationAnalysisResponse]
+    incidents: list[IncidentSummary] = Field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -98,6 +121,7 @@ class OfftrackAnalysisResult:
     annotated_frame_bgr: np.ndarray | None
     track_mask: np.ndarray | None
     violation_mask: np.ndarray | None
+    cars: list[CarTrackLimits]
 
 
 @dataclass(slots=True)

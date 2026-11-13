@@ -2,6 +2,9 @@ const mediaInput = document.getElementById("mediaInput");
 const chooseMediaBtn = document.getElementById("chooseMediaBtn");
 const selectedFileName = document.getElementById("selectedFileName");
 const sampleFpsInput = document.getElementById("sampleFps");
+const cameraIdInput = document.getElementById("cameraId");
+const incidentPanel = document.getElementById("incidentPanel");
+const incidentList = document.getElementById("incidentList");
 const staticTrackModeInput = document.getElementById("staticTrackMode");
 const trackReferenceFramesInput = document.getElementById("trackReferenceFrames");
 const processBtn = document.getElementById("processBtn");
@@ -148,6 +151,9 @@ async function processVideo(videoFile) {
     );
     frameCounter.textContent = "Кадр: -";
 
+    if (!cameraIdInput.reportValidity() || !cameraIdInput.value.trim()) {
+        throw new Error("Укажите ID камеры латиницей, цифрами, через дефис или подчёркивание");
+    }
     const result = await sendVideo(videoFile, sampleFps, staticTrackMode, referenceFrames);
     const frames = result.results || [];
     if (!frames.length) {
@@ -160,16 +166,35 @@ async function processVideo(videoFile) {
     setupVideoViewer(result, frames);
     await renderVideoFrame(0);
 
-    const violationCount = frames.filter((frame) => frame.violation_detected).length;
-    const carCount = countMasks(frames, isCarMask);
+    const incidents = result.incidents || [];
+    renderIncidents(incidents);
     const truncatedText = result.truncated ? " Лимит кадров достигнут." : "";
     const staticTrackText = result.static_track_enabled
         ? ` Фиксированная трасса: кадр ${result.static_track_reference_frame}.`
         : "";
     setStatus(
-        `Видео обработано: ${frames.length} кадров, нарушений: ${violationCount}, машин: ${carCount}.${staticTrackText}${truncatedText}`,
-        violationCount > 0 ? "done-warning" : "done",
+        `Видео обработано: ${frames.length} кадров, инцидентов: ${incidents.length}.${staticTrackText}${truncatedText}`,
+        incidents.length > 0 ? "done-warning" : "done",
     );
+}
+
+function renderIncidents(incidents) {
+    incidentPanel.hidden = false;
+    incidentList.replaceChildren();
+    if (!incidents.length) {
+        const item = document.createElement("li");
+        item.textContent = "Подтверждённых выездов нет";
+        incidentList.append(item);
+        return;
+    }
+    for (const incident of incidents) {
+        const item = document.createElement("li");
+        const link = document.createElement("a");
+        link.href = incident.download_url;
+        link.textContent = `Скачать ZIP · ${incident.start_time.toFixed(2)} с · болид #${incident.track_id}`;
+        item.append(link);
+        incidentList.append(item);
+    }
 }
 
 async function sendFrame(frameBlob, frameIndex) {
@@ -194,7 +219,9 @@ async function sendVideo(videoFile, sampleFps, staticTrackMode, referenceFrames)
     const formData = new FormData();
     formData.append("video", videoFile, videoFile.name || "video.mp4");
     formData.append("sample_fps", String(sampleFps));
-    formData.append("max_frames", "120");
+    formData.append("max_frames", "500");
+    formData.append("camera_id", cameraIdInput.value.trim());
+    formData.append("compact", "true");
     formData.append("static_track_mode", String(staticTrackMode));
     formData.append("track_reference_frames", String(referenceFrames));
 
@@ -227,6 +254,8 @@ function setupVideoViewer(videoResult, frames) {
 function resetVideoViewer() {
     currentVideoResult = null;
     currentVideoFrames = [];
+    incidentPanel.hidden = true;
+    incidentList.replaceChildren();
     currentVideoFrameIndex = 0;
     stopPlayback();
 
@@ -256,7 +285,9 @@ async function renderVideoFrame(index) {
     await drawFrameAndMasks(frameResult);
 
     const total = currentVideoFrames.length;
-    frameCounter.textContent = `Кадр: ${frameResult.frame_index} · ${safeIndex + 1}/${total}`;
+    const sourceIndex = frameResult.source_frame_index ?? frameResult.frame_index;
+    const timestamp = Number.isFinite(frameResult.timestamp) ? ` · ${frameResult.timestamp.toFixed(2)} с` : "";
+    frameCounter.textContent = `Кадр: ${sourceIndex}${timestamp} · ${safeIndex + 1}/${total}`;
     responseBox.textContent = formatVideoResponse(currentVideoResult, frameResult, safeIndex);
     frameSlider.value = String(safeIndex);
     updatePlaybackControls();
@@ -382,9 +413,10 @@ function drawMaskPolygon(mask, width, height) {
     previewCtx.fillStyle = "#101820";
     previewCtx.strokeStyle = "rgba(255,255,255,0.9)";
     previewCtx.lineWidth = 4;
-    previewCtx.strokeText(`${mask.class_name}${confidence}`, labelX, labelY);
+    const label = `${mask.class_name}${mask.track_id == null ? "" : ` #${mask.track_id}`}${confidence}`;
+    previewCtx.strokeText(label, labelX, labelY);
     previewCtx.fillStyle = color;
-    previewCtx.fillText(`${mask.class_name}${confidence}`, labelX, labelY);
+    previewCtx.fillText(label, labelX, labelY);
     previewCtx.restore();
 }
 
@@ -441,6 +473,7 @@ function formatVideoResponse(videoResult, frameResult, framePosition = 0) {
         `source_fps: ${videoResult.source_fps ?? "-"}`,
         `sample_fps: ${videoResult.sample_fps}`,
         `frames_processed: ${videoResult.frames_processed}`,
+        `incidents: ${videoResult.incidents?.length ?? 0}`,
         `frame_position: ${framePosition + 1}/${currentVideoFrames.length || videoResult.frames_processed}`,
         `truncated: ${videoResult.truncated}`,
         `static_track_enabled: ${videoResult.static_track_enabled}`,
@@ -476,6 +509,9 @@ function formatResponse(result) {
         lines.push("");
     }
 
+    for (const car of result.cars || []) {
+        lines.push(`Болид #${car.track_id ?? "-"}: ${car.status}, колёс за границей: ${car.wheels_outside}/${car.wheel_ids.length}`);
+    }
     for (const region of result.violation_regions || []) {
         lines.push(`violation_model: ${region.model_name}`);
         lines.push(`class: ${region.class_id} (${region.class_name})`);
@@ -502,15 +538,11 @@ function formatResponse(result) {
     return lines.join("\n");
 }
 
-function countMasks(frames, predicate) {
-    return frames.reduce((total, frame) => total + (frame.masks || []).filter(predicate).length, 0);
-}
-
 function normalizeFps(value) {
     if (!Number.isFinite(value)) {
-        return 2;
+        return 30;
     }
-    return Math.min(15, Math.max(0.5, value));
+    return Math.min(30, Math.max(0.5, value));
 }
 
 function normalizeReferenceFrames(value) {

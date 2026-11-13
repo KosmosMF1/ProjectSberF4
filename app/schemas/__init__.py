@@ -1,5 +1,7 @@
 from .inference import (
+    CarTrackLimits,
     FrameInferenceResponse,
+    IncidentSummary,
     OfftrackAnalysisResult,
     TrackSegmentationResult,
     VideoInferenceResponse,
@@ -12,7 +14,9 @@ from .inference import (
 )
 
 __all__ = [
+    "CarTrackLimits",
     "FrameInferenceResponse",
+    "IncidentSummary",
     "OfftrackAnalysisResult",
     "TrackSegmentationResult",
     "VideoInferenceResponse",

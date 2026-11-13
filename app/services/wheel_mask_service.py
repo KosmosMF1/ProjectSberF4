@@ -147,6 +147,7 @@ class WheelSegmentationService:
         cls_names = getattr(result, "names", {}) or {}
         polygons = result.masks.xy
         class_ids = result.boxes.cls.detach().cpu().numpy().astype(int)
+        confidences = result.boxes.conf.detach().cpu().numpy()
 
         for i, poly in enumerate(polygons):
             if poly is None or len(poly) < 3:
@@ -160,6 +161,7 @@ class WheelSegmentationService:
             payload.append(
                 {
                     "model_name": "wheel_seg_yolo",
+                    "confidence": round(float(confidences[i]), 6),
                     "class_id": 1,
                     "class_name": self.class_name,
                     "points": self._norm_points(poly_arr, width, height),

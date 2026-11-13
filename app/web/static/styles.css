@@ -79,6 +79,10 @@ body {
     align-self: start;
 }
 
+#incidentPanel {
+    grid-column: 1 / -1;
+}
+
 .hero-copy {
     max-width: 980px;
 }
@@ -133,7 +137,7 @@ h2 {
 .controls-shell {
     margin-top: 22px;
     display: grid;
-    grid-template-columns: minmax(260px, 1fr) 180px minmax(260px, 0.9fr) minmax(190px, auto);
+    grid-template-columns: minmax(200px, 1fr) 125px minmax(215px, 1fr) minmax(120px, 0.6fr) minmax(175px, auto);
     gap: 12px;
     align-items: stretch;
 }
@@ -190,6 +194,7 @@ h2 {
 }
 
 .fps-control input,
+.camera-control input,
 .mini-input-row input {
     border-radius: 14px;
     border: 1px solid rgba(255, 255, 255, 0.18);
@@ -199,7 +204,8 @@ h2 {
     outline: none;
 }
 
-.fps-control input {
+.fps-control input,
+.camera-control input {
     width: 100%;
     height: 46px;
     padding: 0 12px;
@@ -455,7 +461,7 @@ pre {
     }
 
     .primary-action {
-        grid-column: 1 / -1;
+        grid-column: span 2;
         height: 56px;
     }
 }
@@ -470,6 +476,7 @@ pre {
     }
 
     .primary-action {
+        grid-column: 1 / -1;
         height: 56px;
     }
 
