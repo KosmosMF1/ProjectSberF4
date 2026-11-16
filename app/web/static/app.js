@@ -3,6 +3,8 @@ const chooseMediaBtn = document.getElementById("chooseMediaBtn");
 const selectedFileName = document.getElementById("selectedFileName");
 const sampleFpsInput = document.getElementById("sampleFps");
 const cameraIdInput = document.getElementById("cameraId");
+const openCalibrationBtn = document.getElementById("openCalibrationBtn");
+const useCameraCalibrationInput = document.getElementById("useCameraCalibration");
 const incidentPanel = document.getElementById("incidentPanel");
 const incidentList = document.getElementById("incidentList");
 const staticTrackModeInput = document.getElementById("staticTrackMode");
@@ -102,6 +104,7 @@ async function processMedia() {
 
     isProcessing = true;
     processBtn.disabled = true;
+    openCalibrationBtn.disabled = true;
     responseBox.textContent = "Обработка...";
     stopPlayback();
 
@@ -121,6 +124,7 @@ async function processMedia() {
     } finally {
         isProcessing = false;
         processBtn.disabled = !mediaInput.files?.[0];
+        openCalibrationBtn.disabled = detectMediaKind(mediaInput.files?.[0]) !== "video";
     }
 }
 
@@ -169,9 +173,12 @@ async function processVideo(videoFile) {
     const incidents = result.incidents || [];
     renderIncidents(incidents);
     const truncatedText = result.truncated ? " Лимит кадров достигнут." : "";
-    const staticTrackText = result.static_track_enabled
-        ? ` Фиксированная трасса: кадр ${result.static_track_reference_frame}.`
-        : "";
+    let staticTrackText = "";
+    if (result.calibration_camera_id) {
+        staticTrackText = ` Сохранённая граница камеры ${result.calibration_camera_id}.`;
+    } else if (result.static_track_enabled) {
+        staticTrackText = ` Фиксированная трасса: кадр ${result.static_track_reference_frame}.`;
+    }
     setStatus(
         `Видео обработано: ${frames.length} кадров, инцидентов: ${incidents.length}.${staticTrackText}${truncatedText}`,
         incidents.length > 0 ? "done-warning" : "done",
@@ -223,6 +230,7 @@ async function sendVideo(videoFile, sampleFps, staticTrackMode, referenceFrames)
     formData.append("camera_id", cameraIdInput.value.trim());
     formData.append("compact", "true");
     formData.append("static_track_mode", String(staticTrackMode));
+    formData.append("use_camera_calibration", String(useCameraCalibrationInput.checked));
     formData.append("track_reference_frames", String(referenceFrames));
 
     const response = await fetch("/api/infer/video", {
@@ -231,11 +239,24 @@ async function sendVideo(videoFile, sampleFps, staticTrackMode, referenceFrames)
     });
 
     if (!response.ok) {
-        const message = await response.text();
-        throw new Error(`backend ${response.status}: ${message}`);
+        throw new Error(await readBackendError(response));
     }
 
     return response.json();
+}
+
+async function readBackendError(response) {
+    const body = await response.text();
+    try {
+        const { detail } = JSON.parse(body);
+        if (typeof detail === "string") return detail;
+        if (Array.isArray(detail) && detail[0]?.msg) {
+            return detail[0].msg.replace(/^Value error, /, "");
+        }
+    } catch {
+        // Plain-text responses are also accepted.
+    }
+    return `Backend ${response.status}: ${body}`;
 }
 
 function setupVideoViewer(videoResult, frames) {
@@ -479,6 +500,7 @@ function formatVideoResponse(videoResult, frameResult, framePosition = 0) {
         `static_track_enabled: ${videoResult.static_track_enabled}`,
         `static_track_reference_frame: ${videoResult.static_track_reference_frame ?? "-"}`,
         `static_track_reason: ${videoResult.static_track_reason || "-"}`,
+        `calibration_camera_id: ${videoResult.calibration_camera_id ?? "-"}`,
         "",
         "Текущий кадр:",
         formatResponse(frameResult),
@@ -553,6 +575,7 @@ function normalizeReferenceFrames(value) {
 }
 
 function detectMediaKind(file) {
+    if (!file) return "unknown";
     const mimeType = (file.type || "").toLowerCase();
     if (mimeType.startsWith("image/")) {
         return "image";

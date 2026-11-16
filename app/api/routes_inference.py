@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Path as ApiPath, UploadFile
 from fastapi.responses import FileResponse
 
 from app.schemas import (
@@ -31,6 +31,9 @@ from app.services import (
     encode_mask_to_data_url,
 )
 
+from app.services.camera_calibration import (
+    CAMERA_ID_PATTERN, CameraCalibration, load_calibration, save_calibration,
+)
 from app.services.car_tracking import CarTracker, unique_masks
 from app.services.incidents import INCIDENT_DIR, IncidentDetector, evidence_frame, write_incident
 
@@ -349,6 +352,74 @@ def _response(
     )
 
 
+def _store_video_upload(video: UploadFile, work: str) -> str:
+    source = str(Path(work) / f"source{Path(video.filename or 'video').suffix}")
+    total_bytes = 0
+    with open(source, "wb") as output:
+        while chunk := video.file.read(1024 * 1024):
+            total_bytes += len(chunk)
+            if total_bytes > MAX_VIDEO_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Uploaded video is too large")
+            output.write(chunk)
+    if not total_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    return source
+
+
+@router.get("/cameras/{camera_id}/calibration", response_model=CameraCalibration)
+def get_camera_calibration(camera_id: Annotated[str, ApiPath(pattern=CAMERA_ID_PATTERN)]) -> CameraCalibration:
+    calibration = load_calibration(camera_id)
+    if calibration is None:
+        raise HTTPException(status_code=404, detail="Для этой камеры ещё нет сохранённой границы")
+    return calibration
+
+
+@router.put("/cameras/{camera_id}/calibration", response_model=CameraCalibration)
+def put_camera_calibration(
+    camera_id: Annotated[str, ApiPath(pattern=CAMERA_ID_PATTERN)],
+    calibration: CameraCalibration,
+) -> CameraCalibration:
+    save_calibration(camera_id, calibration)
+    return calibration
+
+
+@router.post("/calibration/preview")
+def calibration_preview(
+    video: UploadFile = File(...),
+    time_seconds: Annotated[float, Form(ge=0, le=86400, allow_inf_nan=False)] = 0.0,
+) -> dict:
+    with tempfile.TemporaryDirectory(prefix="track-preview-") as work:
+        source = _store_video_upload(video, work)
+        capture = cv2.VideoCapture(source)
+        try:
+            if not capture.isOpened():
+                raise HTTPException(status_code=400, detail="Не удалось открыть видео")
+            rate = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+            fps = rate if math.isfinite(rate) and rate > 0 else 30.0
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            index = int(time_seconds * fps + 1e-6)
+            if frame_count > 0 and index >= frame_count:
+                raise HTTPException(status_code=422, detail="Указанное время за пределами видео")
+            if index and not capture.set(cv2.CAP_PROP_POS_FRAMES, index):
+                raise HTTPException(status_code=422, detail="Указанное время за пределами видео")
+            ok, frame = capture.read()
+            if not ok:
+                raise HTTPException(status_code=422, detail="Кадр недоступен, выберите другое время")
+            _validate_frame_size(frame)
+            height, width = frame.shape[:2]
+            if width > 1280:
+                frame = cv2.resize(frame, (1280, max(1, round(height * 1280 / width))), interpolation=cv2.INTER_AREA)
+            return {
+                "frame_width": width,
+                "frame_height": height,
+                "frame_data_url": _encode_frame_to_data_url(frame),
+                "timestamp": index / fps,
+                "last_timestamp": (frame_count - 1) / fps if frame_count > 0 else None,
+            }
+        finally:
+            capture.release()
+
+
 def _sample_video_frames(
     capture: cv2.VideoCapture, source_fps: float, sample_fps: float,
 ) -> Iterator[tuple[int, float, np.ndarray]]:
@@ -411,30 +482,21 @@ def infer_video(
     hard_violation_threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.8,
     static_track_mode: Annotated[bool, Form()] = True,
     track_reference_frames: Annotated[int, Form(ge=1, le=120)] = 30,
-    camera_id: Annotated[str, Form(min_length=1, max_length=48, pattern=r"^[A-Za-z0-9_-]+$")] = "camera-1",
+    camera_id: Annotated[str, Form(pattern=CAMERA_ID_PATTERN)] = "camera-1",
     compact: Annotated[bool, Form()] = False,
+    use_camera_calibration: Annotated[bool, Form()] = False,
 ) -> VideoInferenceResponse:
     """Analyze a recording and export one package for each confirmed excursion."""
     _validate_thresholds(offtrack_threshold, hard_violation_threshold)
     filename = video.filename or "video"
-    suffix = Path(filename).suffix
+    calibration = get_camera_calibration(camera_id) if use_camera_calibration else None
     detector = OfftrackDetector(offtrack_threshold, hard_violation_threshold)
     tracker = CarTracker()
     incidents = []
     run_id = uuid4()
 
     with tempfile.TemporaryDirectory(prefix="track-limits-") as work:
-        source = str(Path(work) / f"source{suffix}")
-        total_bytes = 0
-        with open(source, "wb") as output:
-            while chunk := video.file.read(1024 * 1024):
-                total_bytes += len(chunk)
-                if total_bytes > MAX_VIDEO_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Uploaded video is too large")
-                output.write(chunk)
-        if not total_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty")
-
+        source = _store_video_upload(video, work)
         capture = cv2.VideoCapture(source)
         try:
             if not capture.isOpened():
@@ -444,8 +506,8 @@ def infer_video(
             fps = source_fps or 30.0
             frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
             incident_detector = IncidentDetector(min(fps, sample_fps))
-            static_track = None
-            if static_track_mode:
+            static_track = calibration.track_mask() if calibration else None
+            if static_track_mode and calibration is None:
                 reference_count = min(track_reference_frames, max_frames)
                 stride = max(1, math.ceil(reference_count / 8))
                 frames = _sample_video_frames(capture, fps, sample_fps)
@@ -466,6 +528,8 @@ def infer_video(
                     truncated = True
                     break
                 if static_track and (cached_masks is None or cached_masks[0].shape != frame.shape[:2]):
+                    if calibration and not calibration.matches_frame(frame.shape[1], frame.shape[0]):
+                        raise HTTPException(status_code=422, detail="Пропорции кадра отличаются от сохранённой границы камеры")
                     cached_masks = detector.track_masks(frame.shape[:2], static_track["points"])
                 analysis, masks, wheels, points = _analyze_frame(
                     frame, source_index, detector, static_track, cached_masks, tracker, timestamp,
@@ -493,7 +557,9 @@ def infer_video(
                     shutil.copyfile(Path(work) / package, batch / package)
                 batch.rename(INCIDENT_DIR / str(run_id))
 
-    if static_track:
+    if calibration:
+        reason = f"saved track boundary for camera {camera_id}"
+    elif static_track:
         reason = f"fixed track mask selected from source frame {static_track['source_frame_index']}"
     else:
         reason = "no reference track mask found" if static_track_mode else "disabled"
@@ -501,8 +567,9 @@ def infer_video(
         filename=filename, source_fps=source_fps, sample_fps=sample_fps, frames_processed=len(results),
         total_frames_estimate=frame_count if frame_count > 0 else None, truncated=truncated,
         static_track_enabled=bool(static_track),
-        static_track_reference_frame=static_track["source_frame_index"] if static_track else None,
-        static_track_reason=reason, results=results, incidents=incidents,
+        static_track_reference_frame=static_track.get("source_frame_index") if static_track else None,
+        static_track_reason=reason, calibration_camera_id=camera_id if calibration else None,
+        results=results, incidents=incidents,
     )
 
 

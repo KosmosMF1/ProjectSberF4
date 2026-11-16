@@ -492,3 +492,74 @@ pre {
         min-height: 280px;
     }
 }
+
+.calibration-controls,
+.calibration-header,
+.calibration-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.calibration-controls {
+    margin-top: 16px;
+}
+
+.calibration-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.calibration-dialog {
+    width: min(880px, calc(100% - 24px));
+    max-height: calc(100dvh - 24px);
+    padding: clamp(14px, 3vw, 24px);
+    color: var(--ink);
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    box-shadow: var(--shadow);
+}
+
+.calibration-dialog::backdrop {
+    background: rgba(7, 10, 18, 0.78);
+}
+
+.calibration-header {
+    justify-content: space-between;
+}
+
+.calibration-header h2 {
+    overflow-wrap: anywhere;
+}
+
+.calibration-dialog button {
+    width: auto;
+}
+
+.calibration-toolbar input {
+    width: 76px;
+    padding: 7px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    font: inherit;
+}
+
+.calibration-status {
+    min-height: 1em;
+    color: var(--ink);
+}
+
+#calibrationCanvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    cursor: crosshair;
+    border-radius: 8px;
+}
+
+.calibration-actions {
+    margin-top: 14px;
+}

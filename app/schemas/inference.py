@@ -108,6 +108,7 @@ class VideoInferenceResponse(BaseModel):
     static_track_enabled: bool = False
     static_track_reference_frame: int | None = None
     static_track_reason: str | None = None
+    calibration_camera_id: str | None = None
     results: list[ViolationAnalysisResponse]
     incidents: list[IncidentSummary] = Field(default_factory=list)
 
