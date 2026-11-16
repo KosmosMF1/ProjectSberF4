@@ -3,6 +3,12 @@
     const title = document.getElementById("calibrationTitle");
     const canvas = document.getElementById("calibrationCanvas");
     const ctx = canvas.getContext("2d");
+    const viewport = document.getElementById("calibrationViewport");
+    const zoomControls = document.getElementById("calibrationZoomControls");
+    const zoomLevel = document.getElementById("calibrationZoomLevel");
+    const zoomInBtn = document.getElementById("calibrationZoomIn");
+    const zoomOutBtn = document.getElementById("calibrationZoomOut");
+    const zoomResetBtn = document.getElementById("calibrationZoomReset");
     const status = document.getElementById("calibrationStatus");
     const time = document.getElementById("calibrationTime");
     const frameTime = document.getElementById("calibrationFrameTime");
@@ -15,6 +21,24 @@
 
     let draft = null;
     let busy = false;
+    let zoom = 1;
+
+    function setZoom(value) {
+        const x = (viewport.scrollLeft + viewport.clientWidth / 2) / Math.max(1, canvas.offsetWidth);
+        const y = (viewport.scrollTop + viewport.clientHeight / 2) / Math.max(1, canvas.offsetHeight);
+        zoom = clamp(value, 1, 4);
+        canvas.style.width = `${zoom * 100}%`;
+        zoomLevel.textContent = `${zoom * 100}%`;
+        viewport.scrollLeft = x * canvas.offsetWidth - viewport.clientWidth / 2;
+        viewport.scrollTop = y * canvas.offsetHeight - viewport.clientHeight / 2;
+        zoomOutBtn.disabled = zoomResetBtn.disabled = zoom === 1;
+        zoomInBtn.disabled = zoom === 4;
+        draw();
+    }
+
+    zoomInBtn.addEventListener("click", () => setZoom(zoom + 0.5));
+    zoomOutBtn.addEventListener("click", () => setZoom(zoom - 0.5));
+    zoomResetBtn.addEventListener("click", () => setZoom(1));
 
     function refreshControls() {
         previewBtn.disabled = time.disabled = busy;
@@ -47,6 +71,7 @@
         const { points, image } = draft;
         const { width, height } = canvas;
         ctx.drawImage(image, 0, 0, width, height);
+        const pixelScale = width / Math.max(1, canvas.clientWidth);
 
         if (points.length) {
             ctx.beginPath();
@@ -60,12 +85,12 @@
                 ctx.fill();
             }
             ctx.strokeStyle = "#60ffd5";
-            ctx.lineWidth = 3;
+            ctx.lineWidth = 2 * pixelScale;
             ctx.stroke();
 
             for (const [x, y] of points) {
                 ctx.beginPath();
-                ctx.arc(x * width, y * height, 4, 0, 2 * Math.PI);
+                ctx.arc(x * width, y * height, 4 * pixelScale, 0, 2 * Math.PI);
                 ctx.fillStyle = "#ffffff";
                 ctx.fill();
             }
@@ -96,7 +121,9 @@
         draft.image = image;
         canvas.width = image.naturalWidth;
         canvas.height = image.naturalHeight;
-        canvas.hidden = false;
+        viewport.hidden = false;
+        zoomControls.hidden = false;
+        if (firstPreview) setZoom(1);
         frameTime.textContent = `Кадр на ${frame.timestamp.toFixed(2)} с`;
         if (frame.last_timestamp !== null) {
             time.max = String(frame.last_timestamp);
@@ -139,7 +166,8 @@
             controller: new AbortController(), points: [], frame: null, image: null,
         };
         title.textContent = `Граница трассы · ${cameraId}`;
-        canvas.hidden = true;
+        viewport.hidden = true;
+        zoomControls.hidden = true;
         time.value = "0";
         time.removeAttribute("max");
         frameTime.textContent = "";

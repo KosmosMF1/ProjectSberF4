@@ -7,6 +7,9 @@ from app.schemas import CarTrackLimits, OfftrackAnalysisResult, WheelOfftrackDet
 from app.services.car_tracking import assign_wheels, box_for
 
 
+MAX_WHEELS_PER_CAR = 4
+
+
 class OfftrackDetector:
     """Evaluate four distinct wheel masks belonging to the same car."""
 
@@ -52,11 +55,17 @@ class OfftrackDetector:
         if tolerant is None and track_points and len(track_points) >= 3:
             track, tolerant = self.track_masks((height, width), track_points)
 
+        candidates_by_car = assign_wheels(car_masks, wheel_masks)
+        wheels_by_car = [
+            sorted(indices, key=lambda index: wheel_masks[index].get("confidence") or 0, reverse=True)[:MAX_WHEELS_PER_CAR]
+            for indices in candidates_by_car
+        ]
+        matched_wheels = sorted(index for indices in wheels_by_car for index in indices)
         details: dict[int, WheelOfftrackDetail] = {}
         outside_regions: dict[int, tuple[int, int, np.ndarray]] = {}
         if tolerant is not None:
-            for index, wheel in enumerate(wheel_masks):
-                polygon = self._to_abs_polygon(wheel["points"], width, height)
+            for index in matched_wheels:
+                polygon = self._to_abs_polygon(wheel_masks[index]["points"], width, height)
                 x, y, w, h = cv2.boundingRect(polygon)
                 left, top = max(0, x), max(0, y)
                 right, bottom = min(width, x + w), min(height, y + h)
@@ -76,20 +85,22 @@ class OfftrackDetector:
                 outside_regions[index] = left, top, outside
 
         cars = []
-        for car, indices in zip(car_masks, assign_wheels(car_masks, wheel_masks), strict=True):
+        for car, candidates, indices in zip(car_masks, candidates_by_car, wheels_by_car, strict=True):
             scores = [details[index].outside_ratio for index in indices if index in details]
             wheels_beyond_edge = sum(score >= self.offtrack_threshold for score in scores)
-            if len(scores) == 4 and min(scores) >= self.hard_violation_threshold:
+            if len(candidates) > MAX_WHEELS_PER_CAR:
+                status = "unknown"
+            elif len(scores) == MAX_WHEELS_PER_CAR and min(scores) >= self.hard_violation_threshold:
                 status = "outside"
             elif 0 < wheels_beyond_edge < len(scores):
                 status = "partial"
-            elif len(scores) == 4 and wheels_beyond_edge == 0:
+            elif len(scores) == MAX_WHEELS_PER_CAR and wheels_beyond_edge == 0:
                 status = "inside"
             else:
                 status = "unknown"
             cars.append(CarTrackLimits(
                 track_id=car.get("track_id"), bbox_xyxy=box_for(car), status=status,
-                wheel_ids=indices, wheels_outside=wheels_beyond_edge,
+                wheel_ids=indices, wheels_outside=wheels_beyond_edge, wheel_candidates=len(candidates),
             ))
 
         confirmed = [car for car in cars if car.status == "outside"]
@@ -114,8 +125,8 @@ class OfftrackDetector:
             if track_points:
                 cv2.polylines(annotated, [self._to_abs_polygon(track_points, width, height)],
                               True, (0, 255, 255), 3)
-            for wheel in wheel_masks:
-                cv2.polylines(annotated, [self._to_abs_polygon(wheel["points"], width, height)],
+            for index in matched_wheels:
+                cv2.polylines(annotated, [self._to_abs_polygon(wheel_masks[index]["points"], width, height)],
                               True, (255, 255, 255), 2)
 
         if confirmed:

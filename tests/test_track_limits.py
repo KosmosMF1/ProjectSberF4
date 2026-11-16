@@ -52,6 +52,18 @@ class TrackLimitsTests(unittest.TestCase):
         result = self.analyze(wheels, [rectangle(0.61, 0.19, 0.78, 0.36)])
         self.assertFalse(result.violation_detected)
 
+    def test_ambiguous_fifth_wheel_never_confirms_an_exit(self):
+        car = rectangle(0.61, 0.19, 0.78, 0.36)
+        wheels = wheels_at(0.63, 0.21) + [rectangle(0.685, 0.265, 0.71, 0.29, confidence=0.35)]
+        result = self.analyze(wheels, [car])
+        detection = result.cars[0]
+
+        self.assertFalse(result.violation_detected)
+        self.assertEqual(detection.status, "unknown")
+        self.assertEqual(detection.wheel_candidates, 5)
+        self.assertEqual(detection.wheel_ids, [0, 1, 2, 3])
+        self.assertEqual({wheel.instance_id for wheel in result.offtrack_wheels}, {0, 1, 2, 3})
+
     def test_tracker_keeps_ids_after_reordered_detections_and_a_missing_frame(self):
         tracker = CarTracker()
         a = rectangle(0.10, 0.10, 0.25, 0.25)

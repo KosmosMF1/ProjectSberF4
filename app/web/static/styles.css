@@ -552,8 +552,24 @@ pre {
     color: var(--ink);
 }
 
+.calibration-zoom {
+    margin-bottom: 10px;
+}
+
+.calibration-zoom output {
+    min-width: 4ch;
+    font-variant-numeric: tabular-nums;
+}
+
+.calibration-viewport {
+    max-height: min(55dvh, 580px);
+    overflow: auto;
+    border-radius: 8px;
+}
+
 #calibrationCanvas {
     display: block;
+    max-width: none;
     width: 100%;
     height: auto;
     cursor: crosshair;

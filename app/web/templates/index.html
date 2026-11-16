@@ -47,9 +47,8 @@
                         </span>
                     </label>
                     <label class="mini-input-row" for="trackReferenceFrames">
-                        <span>Искать среди первых</span>
-                        <input id="trackReferenceFrames" type="number" min="1" max="120" step="1" value="30" />
-                        <span>кадров</span>
+                        <span>Опорных кадров</span>
+                        <input id="trackReferenceFrames" type="number" min="1" max="8" step="1" value="8" />
                     </label>
                 </div>
 
@@ -139,7 +138,15 @@
             <span id="calibrationFrameTime"></span>
         </form>
         <p id="calibrationStatus" class="calibration-status" role="status"></p>
-        <canvas id="calibrationCanvas" aria-label="Кадр для разметки границы трассы" hidden></canvas>
+        <div id="calibrationZoomControls" class="calibration-toolbar calibration-zoom" hidden>
+            <button id="calibrationZoomOut" class="secondary-action" type="button" aria-label="Уменьшить масштаб">−</button>
+            <output id="calibrationZoomLevel" aria-label="Масштаб">100%</output>
+            <button id="calibrationZoomIn" class="secondary-action" type="button" aria-label="Увеличить масштаб">+</button>
+            <button id="calibrationZoomReset" class="secondary-action" type="button">Сбросить масштаб</button>
+        </div>
+        <div id="calibrationViewport" class="calibration-viewport" tabindex="0" aria-label="Область разметки с прокруткой" hidden>
+            <canvas id="calibrationCanvas" aria-label="Кадр для разметки границы трассы"></canvas>
+        </div>
         <div class="calibration-toolbar calibration-actions">
             <button id="undoCalibrationPoint" class="secondary-action" type="button">Убрать точку</button>
             <button id="clearCalibrationPoints" class="secondary-action" type="button">Очистить</button>

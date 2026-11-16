@@ -36,6 +36,7 @@ from app.services.camera_calibration import (
 )
 from app.services.car_tracking import CarTracker, unique_masks
 from app.services.incidents import INCIDENT_DIR, IncidentDetector, evidence_frame, write_incident
+from app.services.track_consensus import consensus_track_polygon, reference_frame_indices
 
 router = APIRouter()
 
@@ -166,21 +167,13 @@ def _select_static_track_payload(
     sampled_frames: list[SampledFrame],
     reference_frames: int,
 ) -> dict[str, Any] | None:
-    """Choose one stable track mask for a fixed judge camera.
-
-    The mask is selected from the first `reference_frames` sampled frames. We prefer
-    frames with fewer dynamic objects (wheels/cars) and then the largest detected
-    track polygon. This usually picks the least occluded frame; if the video has no
-    empty frame, it still chooses the best available reference.
-    """
-    best_payload: dict[str, Any] | None = None
-    best_dynamic_count: int | None = None
-    best_area = -1.0
+    """Choose an anchor with few obstructions and combine compatible masks."""
+    candidates: list[dict[str, Any]] = []
 
     for frame_index, frame_bgr in sampled_frames[:reference_frames]:
         track_payloads = track_service.build_track_mask_payload(frame_bgr, frame_index)
         track_payload = _select_track_payload(track_payloads)
-        if not track_payload:
+        if not track_payload or not _polygon_area(track_payload["points"]):
             continue
 
         dynamic_count = 0
@@ -197,19 +190,23 @@ def _select_static_track_payload(
             # Same idea for the optional car model.
             pass
 
-        area = _polygon_area(track_payload.get("points", []))
-        is_better = (
-            best_payload is None
-            or dynamic_count < (best_dynamic_count if best_dynamic_count is not None else 10**9)
-            or (dynamic_count == best_dynamic_count and area > best_area)
+        candidates.append(_make_static_track_payload(track_payload, frame_index, dynamic_count))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda mask: (mask["reference_dynamic_masks"], -mask["reference_area"]))
+    anchor = candidates[0]
+    consensus = consensus_track_polygon(
+        anchor["points"], [candidate["points"] for candidate in candidates[1:]],
+    )
+    if consensus is not None:
+        points, count = consensus
+        anchor.update(
+            model_name="track_seg_yolo_static_consensus", points=points,
+            yolo_segmentation=_to_yolo_segmentation(0, points), reference_samples=count,
+            reference_area=round(_polygon_area(points), 6),
         )
-
-        if is_better:
-            best_payload = _make_static_track_payload(track_payload, frame_index, dynamic_count)
-            best_dynamic_count = dynamic_count
-            best_area = area
-
-    return best_payload
+    return anchor
 
 
 def _mask_to_violation_regions(
@@ -509,14 +506,24 @@ def infer_video(
             static_track = calibration.track_mask() if calibration else None
             if static_track_mode and calibration is None:
                 reference_count = min(track_reference_frames, max_frames)
-                stride = max(1, math.ceil(reference_count / 8))
-                frames = _sample_video_frames(capture, fps, sample_fps)
-                candidates = [
-                    (index, frame)
-                    for index, _, frame in islice(frames, 0, reference_count, stride)
-                ]
+                budget = min(reference_count, 8)
+                candidates: list[SampledFrame] = []
+                if frame_count > 0:
+                    for index in reference_frame_indices(frame_count, fps, sample_fps, max_frames, budget):
+                        if index and not capture.set(cv2.CAP_PROP_POS_FRAMES, index):
+                            continue
+                        ok, frame = capture.read()
+                        if ok:
+                            _validate_frame_size(frame)
+                            candidates.append((index, frame))
+                else:
+                    frames = _sample_video_frames(capture, fps, sample_fps)
+                    window = min(max_frames, max(track_reference_frames, 30))
+                    stride = max(1, math.ceil(window / budget))
+                    candidates = [(i, frame) for i, _, frame in islice(frames, 0, window, stride)]
+                    frames.close()
                 static_track = _select_static_track_payload(candidates, len(candidates))
-                del candidates, frames
+                del candidates
                 capture.release()
                 capture = cv2.VideoCapture(source)
 
@@ -559,6 +566,8 @@ def infer_video(
 
     if calibration:
         reason = f"saved track boundary for camera {camera_id}"
+    elif static_track and static_track.get("reference_samples"):
+        reason = f"automatic track boundary from {static_track['reference_samples']} frames"
     elif static_track:
         reason = f"fixed track mask selected from source frame {static_track['source_frame_index']}"
     else:
@@ -568,6 +577,7 @@ def infer_video(
         total_frames_estimate=frame_count if frame_count > 0 else None, truncated=truncated,
         static_track_enabled=bool(static_track),
         static_track_reference_frame=static_track.get("source_frame_index") if static_track else None,
+        static_track_reference_samples=static_track.get("reference_samples") if static_track else None,
         static_track_reason=reason, calibration_camera_id=camera_id if calibration else None,
         results=results, incidents=incidents,
     )

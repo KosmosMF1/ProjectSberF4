@@ -66,6 +66,7 @@ class CarTrackLimits(BaseModel):
     status: Literal["inside", "partial", "outside", "unknown"]
     wheel_ids: list[int]
     wheels_outside: int
+    wheel_candidates: int = 0
 
 
 class IncidentSummary(BaseModel):
@@ -107,6 +108,7 @@ class VideoInferenceResponse(BaseModel):
     truncated: bool
     static_track_enabled: bool = False
     static_track_reference_frame: int | None = None
+    static_track_reference_samples: int | None = None
     static_track_reason: str | None = None
     calibration_camera_id: str | None = None
     results: list[ViolationAnalysisResponse]

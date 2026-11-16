@@ -176,6 +176,8 @@ async function processVideo(videoFile) {
     let staticTrackText = "";
     if (result.calibration_camera_id) {
         staticTrackText = ` Сохранённая граница камеры ${result.calibration_camera_id}.`;
+    } else if (result.static_track_reference_samples) {
+        staticTrackText = ` Граница трассы по ${result.static_track_reference_samples} кадрам.`;
     } else if (result.static_track_enabled) {
         staticTrackText = ` Фиксированная трасса: кадр ${result.static_track_reference_frame}.`;
     }
@@ -382,7 +384,17 @@ async function drawFrameAndMasks(result) {
     previewCtx.drawImage(image, 0, 0, previewCanvas.width, previewCanvas.height);
 
     const masks = result.masks || [];
-    for (const mask of masks.filter((item) => !isCarMask(item))) {
+    const assignedWheels = Array.isArray(result.cars)
+        ? new Set(result.cars.flatMap((car) => car.wheel_ids))
+        : null;
+    let wheelIndex = 0;
+    for (const mask of masks) {
+        if (isCarMask(mask)) continue;
+        if (isWheelMask(mask)) {
+            const selected = assignedWheels === null || assignedWheels.has(wheelIndex);
+            wheelIndex += 1;
+            if (!selected) continue;
+        }
         drawMaskPolygon(mask, previewCanvas.width, previewCanvas.height);
     }
     for (const mask of masks.filter(isCarMask)) {
@@ -508,10 +520,14 @@ function formatVideoResponse(videoResult, frameResult, framePosition = 0) {
     return lines.join("\n");
 }
 
+function isWheelMask(mask) {
+    return mask.class_id === 1 || String(mask.class_name || "").toLowerCase().includes("wheel");
+}
+
 function formatResponse(result) {
     const masks = result.masks || [];
     const trackCount = masks.filter((mask) => mask.class_id === 0).length;
-    const wheelCount = masks.filter((mask) => mask.class_id === 1 || String(mask.class_name || "").toLowerCase().includes("wheel")).length;
+    const wheelCount = masks.filter(isWheelMask).length;
     const carCount = masks.filter(isCarMask).length;
 
     const lines = [
@@ -532,7 +548,11 @@ function formatResponse(result) {
     }
 
     for (const car of result.cars || []) {
-        lines.push(`Болид #${car.track_id ?? "-"}: ${car.status}, колёс за границей: ${car.wheels_outside}/${car.wheel_ids.length}`);
+        if (car.wheel_candidates > car.wheel_ids.length) {
+            lines.push(`Болид #${car.track_id ?? "-"}: модель дала ${car.wheel_candidates} кандидатов, кадр пропущен для подтверждения выезда`);
+        } else {
+            lines.push(`Болид #${car.track_id ?? "-"}: ${car.status}, колёс за границей: ${car.wheels_outside}/${car.wheel_ids.length}`);
+        }
     }
     for (const region of result.violation_regions || []) {
         lines.push(`violation_model: ${region.model_name}`);
@@ -569,9 +589,9 @@ function normalizeFps(value) {
 
 function normalizeReferenceFrames(value) {
     if (!Number.isFinite(value)) {
-        return 30;
+        return 8;
     }
-    return Math.min(120, Math.max(1, Math.round(value)));
+    return Math.min(8, Math.max(1, Math.round(value)));
 }
 
 function detectMediaKind(file) {
