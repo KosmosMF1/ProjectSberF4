@@ -1,6 +1,7 @@
 import json
 import math
 import os
+from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,9 +11,10 @@ from zipfile import ZIP_STORED, ZipFile
 import cv2
 import numpy as np
 
-from app.schemas import CarTrackLimits, IncidentSummary
+from app.schemas import CarTrackLimits, IncidentSummary, ViolationAnalysisResponse
 
 INCIDENT_DIR = Path(os.getenv("INCIDENT_DIR", "./incidents")).resolve()
+MAX_INCIDENT_GAP_SECONDS = 0.25
 
 
 @dataclass
@@ -23,6 +25,7 @@ class TrackEvidence:
     last_outside: float | None = None
     returned_at: float | None = None
     active: bool = False
+    last_verified_outside: tuple[int, float] | None = None
 
 
 @dataclass
@@ -41,6 +44,7 @@ class IncidentDetector:
     def __init__(self, sample_fps: float) -> None:
         self.max_gap = max(0.15, 1.5 / sample_fps)
         self.tracks: dict[int, TrackEvidence] = {}
+        self._gaps: list[tuple[int, int, int]] = []
 
     def update(self, cars: list[CarTrackLimits], frame: int, timestamp: float) -> list[Incident]:
         self.tracks = {
@@ -58,6 +62,7 @@ class IncidentDetector:
                 state.candidate = None
                 state.last_outside = None
                 if car.status in {"inside", "partial"}:
+                    state.last_verified_outside = None
                     if state.returned_at is None:
                         state.returned_at = timestamp
                     if timestamp - state.returned_at >= 0.2:
@@ -68,6 +73,12 @@ class IncidentDetector:
 
             state.returned_at = None
             if state.active:
+                if state.last_verified_outside is not None:
+                    previous_frame, previous_time = state.last_verified_outside
+                    if (frame - previous_frame > 1
+                            and timestamp - previous_time <= MAX_INCIDENT_GAP_SECONDS):
+                        self._gaps.append((car.track_id, previous_frame, frame))
+                state.last_verified_outside = frame, timestamp
                 continue
             if (state.candidate is None or state.last_outside is None
                     or timestamp - state.last_outside > self.max_gap):
@@ -80,6 +91,7 @@ class IncidentDetector:
                 car, tuple(state.trajectory),
             ))
             state.active = True
+            state.last_verified_outside = frame, timestamp
         # A missing detection breaks a pending confirmation but keeps active events latched.
         for state in self.tracks.values():
             if state.seen_at < timestamp:
@@ -87,6 +99,18 @@ class IncidentDetector:
                 state.last_outside = None
                 state.returned_at = None
         return incidents
+
+    def mark_gap_frames(self, results: list[ViolationAnalysisResponse]) -> None:
+        """Show where adjacent evidence covers a detection gap in a confirmed incident."""
+        source_indices = [
+            frame.source_frame_index if frame.source_frame_index is not None else frame.frame_index
+            for frame in results
+        ]
+        for track_id, previous, following in self._gaps:
+            start = bisect_right(source_indices, previous)
+            end = bisect_left(source_indices, following)
+            for frame in results[start:end]:
+                frame.incident_gap_track_ids.append(track_id)
 
 
 def evidence_frame(

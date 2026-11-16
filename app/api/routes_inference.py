@@ -574,6 +574,7 @@ def infer_video(
 
         if not results:
             raise HTTPException(status_code=400, detail="No frames were decoded from the uploaded video")
+        incident_detector.mark_gap_frames(results)
         if incidents:
             INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(dir=INCIDENT_DIR) as staging:

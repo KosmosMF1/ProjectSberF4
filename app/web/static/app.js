@@ -407,6 +407,27 @@ async function drawFrameAndMasks(result) {
             drawViolationRegion(region, previewCanvas.width, previewCanvas.height);
         }
     }
+    const gapLabel = incidentGapLabel(result);
+    if (gapLabel) {
+        previewCtx.save();
+        const x = 12;
+        const y = 12;
+        const maxTextWidth = previewCanvas.width - 2 * x - 16;
+        if (maxTextWidth > 0) {
+            previewCtx.font = "700 15px 'IBM Plex Sans', sans-serif";
+            previewCtx.fillStyle = "rgba(18, 23, 31, 0.9)";
+            previewCtx.fillRect(x, y, Math.min(previewCtx.measureText(gapLabel).width, maxTextWidth) + 16, 30);
+            previewCtx.fillStyle = "#ffcc66";
+            previewCtx.fillText(gapLabel, x + 8, y + 20, maxTextWidth);
+        }
+        previewCtx.restore();
+    }
+}
+
+function incidentGapLabel(result) {
+    const tracks = result.incident_gap_track_ids || [];
+    if (!tracks.length) return "";
+    return "Выезд по соседним кадрам · " + tracks.map(id => "#" + id).join(", ");
 }
 
 function configurePreviewCanvas(width, height) {
@@ -546,6 +567,9 @@ function formatResponse(result) {
         lines.push(`reason: ${result.reason || "-"}`);
         lines.push("");
     }
+
+    const gapLabel = incidentGapLabel(result);
+    if (gapLabel) lines.push(gapLabel + ". На этом кадре недостаточно данных.");
 
     for (const car of result.cars || []) {
         if (car.wheel_candidates > car.wheel_ids.length) {

@@ -95,6 +95,7 @@ class ViolationAnalysisResponse(BaseModel):
     violation_regions: list[ViolationRegion] | None
     masks: list[dict[str, Any]]
     cars: list[CarTrackLimits] = Field(default_factory=list)
+    incident_gap_track_ids: list[int] = Field(default_factory=list)
     source_frame_index: int | None = None
     timestamp: float | None = None
 
