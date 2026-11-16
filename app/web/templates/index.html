@@ -130,7 +130,7 @@
             <h2 id="calibrationTitle">Граница трассы</h2>
             <button id="closeCalibrationBtn" class="secondary-action" type="button">Закрыть</button>
         </div>
-        <p>Выбери кадр, где видны обе границы. Расставь точки по контуру разрешённой области и сохрани.</p>
+        <p>Щёлкай для добавления точек и перетаскивай их для уточнения контура. Кисть добавляет область трассы, ластик убирает её.</p>
         <form id="calibrationPreviewForm" class="calibration-toolbar">
             <label for="calibrationTime">Время, с</label>
             <input id="calibrationTime" type="number" min="0" step="any" required value="0" />
@@ -144,11 +144,21 @@
             <button id="calibrationZoomIn" class="secondary-action" type="button" aria-label="Увеличить масштаб">+</button>
             <button id="calibrationZoomReset" class="secondary-action" type="button">Сбросить масштаб</button>
         </div>
+        <div id="calibrationTools" class="calibration-toolbar calibration-tools" role="group" aria-label="Инструменты разметки" hidden>
+            <button data-calibration-tool="points" class="secondary-action" type="button" aria-pressed="true">Точки</button>
+            <button data-calibration-tool="paint" class="secondary-action" type="button" aria-pressed="false">Кисть</button>
+            <button data-calibration-tool="erase" class="secondary-action" type="button" aria-pressed="false">Ластик</button>
+            <label id="calibrationBrushControls" class="calibration-brush" hidden>
+                Размер
+                <input id="calibrationBrushSize" type="range" min="4" max="160" step="2" value="40">
+                <output id="calibrationBrushValue" for="calibrationBrushSize">40 px</output>
+            </label>
+        </div>
         <div id="calibrationViewport" class="calibration-viewport" tabindex="0" aria-label="Область разметки с прокруткой" hidden>
             <canvas id="calibrationCanvas" aria-label="Кадр для разметки границы трассы"></canvas>
         </div>
         <div class="calibration-toolbar calibration-actions">
-            <button id="undoCalibrationPoint" class="secondary-action" type="button">Убрать точку</button>
+            <button id="undoCalibrationPoint" class="secondary-action" type="button">Отменить действие</button>
             <button id="clearCalibrationPoints" class="secondary-action" type="button">Очистить</button>
             <button id="saveCalibrationBtn" class="secondary-action secondary-action-strong" type="button">Сохранить границу</button>
         </div>

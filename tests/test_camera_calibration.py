@@ -3,9 +3,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import cv2
+import numpy as np
 from pydantic import ValidationError
 
-from app.services.camera_calibration import CameraCalibration, load_calibration, save_calibration
+from app.services.camera_calibration import (
+    CameraCalibration, load_calibration, outline_from_mask, save_calibration,
+)
 
 
 class CameraCalibrationTests(unittest.TestCase):
@@ -52,6 +56,31 @@ class CameraCalibrationTests(unittest.TestCase):
         ):
             with self.subTest(points=points), self.assertRaises(ValidationError):
                 CameraCalibration(frame_width=2560, frame_height=1440, points=points)
+
+    def test_outline_keeps_a_brush_edit_as_a_valid_boundary(self):
+        mask = np.zeros((121, 201), dtype=np.uint8)
+        cv2.rectangle(mask, (20, 30), (180, 100), 255, -1)
+        cv2.rectangle(mask, (80, 65), (120, 100), 0, -1)
+        cv2.circle(mask, (50, 29), 12, 255, -1)
+
+        points = outline_from_mask(mask)
+        boundary = CameraCalibration(frame_width=201, frame_height=121, points=points)
+        polygon = np.rint(np.asarray(boundary.points) * [200, 120]).astype(np.int32)
+        self.assertGreater(cv2.pointPolygonTest(polygon, (50, 23), False), 0)
+        self.assertLess(cv2.pointPolygonTest(polygon, (100, 80), False), 0)
+        self.assertGreater(cv2.pointPolygonTest(polygon, (150, 70), False), 0)
+
+    def test_outline_requires_one_connected_region_without_holes(self):
+        empty = np.zeros((60, 100), dtype=np.uint8)
+        separate = empty.copy()
+        separate[10:30, 10:35] = 255
+        separate[40:50, 60:90] = 255
+        hole = empty.copy()
+        hole[10:50, 10:90] = 255
+        hole[20:40, 20:30] = 0
+        for name, mask in (("empty", empty), ("separate", separate), ("hole", hole)):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                outline_from_mask(mask)
 
 
 if __name__ == "__main__":

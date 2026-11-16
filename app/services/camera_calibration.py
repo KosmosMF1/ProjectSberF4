@@ -3,7 +3,9 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Annotated
 
-from pydantic import BaseModel, Field, model_validator
+import cv2
+import numpy as np
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 CAMERA_ID_PATTERN = r"^[A-Za-z0-9_-]{1,48}$"
 CALIBRATION_DIR = Path(os.getenv("CAMERA_CALIBRATION_DIR", "./calibrations")).resolve()
@@ -64,6 +66,27 @@ class CameraCalibration(BaseModel):
             "class_name": "track",
             "points": [list(point) for point in self.points],
         }
+
+
+def outline_from_mask(mask: np.ndarray) -> list[Point]:
+    """Convert a painted region into an editable camera boundary."""
+    height, width = mask.shape
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("Закрась область трассы перед сохранением")
+    if len(contours) != 1:
+        raise ValueError("Закрашенная зона должна быть цельной. Соедини участки кистью и закрась отверстия.")
+
+    scale = np.array([max(width - 1, 1), max(height - 1, 1)])
+    for tolerance in (0.8, 1.5, 2.5, 4.0):
+        points = cv2.approxPolyDP(contours[0], tolerance, True).reshape(-1, 2) / scale
+        if not 3 <= len(points) <= 256:
+            continue
+        try:
+            return CameraCalibration(frame_width=width, frame_height=height, points=points.tolist()).points
+        except ValidationError:
+            continue
+    raise ValueError("Не удалось построить простой контур. Сгладь края закрашенной области.")
 
 
 def load_calibration(camera_id: str) -> CameraCalibration | None:

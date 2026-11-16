@@ -32,7 +32,7 @@ from app.services import (
 )
 
 from app.services.camera_calibration import (
-    CAMERA_ID_PATTERN, CameraCalibration, load_calibration, save_calibration,
+    CAMERA_ID_PATTERN, CameraCalibration, load_calibration, outline_from_mask, save_calibration,
 )
 from app.services.car_tracking import CarTracker, unique_masks
 from app.services.incidents import INCIDENT_DIR, IncidentDetector, evidence_frame, write_incident
@@ -378,6 +378,27 @@ def put_camera_calibration(
 ) -> CameraCalibration:
     save_calibration(camera_id, calibration)
     return calibration
+
+
+@router.post("/calibration/outline")
+def calibration_outline(mask: UploadFile = File(...)) -> dict:
+    payload = _read_upload_bytes(mask, MAX_UPLOAD_BYTES)
+    if len(payload) < 24 or not payload.startswith(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"):
+        raise HTTPException(status_code=400, detail="Ожидается PNG с закрашенной областью")
+    width = int.from_bytes(payload[16:20], "big")
+    height = int.from_bytes(payload[20:24], "big")
+    if not 0 < width * height <= MAX_FRAME_PIXELS:
+        raise HTTPException(status_code=413, detail="Недопустимый размер маски")
+    pixels = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if pixels is None or pixels.ndim != 3 or pixels.shape[2] not in (3, 4) or pixels.dtype != np.uint8:
+        raise HTTPException(status_code=400, detail="Не удалось прочитать маску редактора")
+    channel = 3 if pixels.shape[2] == 4 else 1
+    binary = (pixels[:, :, channel] > 127).astype(np.uint8)
+    try:
+        points = outline_from_mask(binary)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"points": points}
 
 
 @router.post("/calibration/preview")
