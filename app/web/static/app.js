@@ -181,6 +181,9 @@ async function processVideo(videoFile) {
     } else if (result.static_track_enabled) {
         staticTrackText = ` Фиксированная трасса: кадр ${result.static_track_reference_frame}.`;
     }
+    if (result.stabilized_frames > 0) {
+        staticTrackText += ` Сдвиг границы скорректирован на ${result.stabilized_frames} кадрах.`;
+    }
     setStatus(
         `Видео обработано: ${frames.length} кадров, инцидентов: ${incidents.length}.${staticTrackText}${truncatedText}`,
         incidents.length > 0 ? "done-warning" : "done",
@@ -533,6 +536,7 @@ function formatVideoResponse(videoResult, frameResult, framePosition = 0) {
         `static_track_enabled: ${videoResult.static_track_enabled}`,
         `static_track_reference_frame: ${videoResult.static_track_reference_frame ?? "-"}`,
         `static_track_reason: ${videoResult.static_track_reason || "-"}`,
+        `stabilized_frames: ${videoResult.stabilized_frames ?? 0}`,
         `calibration_camera_id: ${videoResult.calibration_camera_id ?? "-"}`,
         "",
         "Текущий кадр:",

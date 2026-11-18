@@ -458,11 +458,13 @@
             const active = draft;
             await applyBrushEdits();
             if (active !== draft) return;
-            const { frame_width, frame_height } = active.frame;
+            const { frame_width, frame_height, frame_data_url } = active.frame;
             const response = await fetch(active.path, {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ frame_width, frame_height, points: active.points }),
+                body: JSON.stringify({
+                    frame_width, frame_height, points: active.points, reference_frame_data_url: frame_data_url,
+                }),
                 signal: active.controller.signal,
             });
             if (!response.ok) throw new Error(await readBackendError(response));

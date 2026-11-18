@@ -110,6 +110,7 @@ class VideoInferenceResponse(BaseModel):
     static_track_enabled: bool = False
     static_track_reference_frame: int | None = None
     static_track_reference_samples: int | None = None
+    stabilized_frames: int = 0
     static_track_reason: str | None = None
     calibration_camera_id: str | None = None
     results: list[ViolationAnalysisResponse]

@@ -1,10 +1,14 @@
+import base64
+import binascii
 import os
+from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Annotated
 
 import cv2
 import numpy as np
+from PIL import Image
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 CAMERA_ID_PATTERN = r"^[A-Za-z0-9_-]{1,48}$"
@@ -37,6 +41,7 @@ class CameraCalibration(BaseModel):
     frame_width: int = Field(gt=0, le=25_000_000)
     frame_height: int = Field(gt=0, le=25_000_000)
     points: list[Point] = Field(min_length=3, max_length=256)
+    reference_frame_data_url: str | None = Field(default=None, max_length=4_000_000)
 
     @model_validator(mode="after")
     def validate_boundary(self) -> "CameraCalibration":
@@ -53,11 +58,29 @@ class CameraCalibration(BaseModel):
                     continue
                 if _segments_intersect(a, b, *edges[j]):
                     raise ValueError("Граница трассы не должна пересекать сама себя")
+        if self.reference_frame_data_url is not None:
+            self.reference_frame()
         return self
 
     def matches_frame(self, width: int, height: int) -> bool:
         scale = (width * self.frame_height) / (height * self.frame_width)
         return abs(scale - 1) <= 0.005
+
+    def reference_frame(self) -> np.ndarray | None:
+        if self.reference_frame_data_url is None:
+            return None
+        header, _, payload = self.reference_frame_data_url.partition(",")
+        if header != "data:image/jpeg;base64":
+            raise ValueError("Опорный кадр должен быть в формате JPEG")
+        try:
+            with Image.open(BytesIO(base64.b64decode(payload, validate=True))) as image:
+                if image.format != "JPEG" or image.width * image.height > 25_000_000:
+                    raise ValueError("Недопустимый формат или размер опорного кадра")
+                if not self.matches_frame(image.width, image.height):
+                    raise ValueError("Пропорции опорного кадра и разметки должны совпадать")
+                return np.asarray(image.convert("L"))
+        except (binascii.Error, OSError, Image.DecompressionBombError) as exc:
+            raise ValueError("Не удалось прочитать опорный кадр") from exc
 
     def track_mask(self) -> dict:
         return {

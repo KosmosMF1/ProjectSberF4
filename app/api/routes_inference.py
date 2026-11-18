@@ -37,6 +37,7 @@ from app.services.camera_calibration import (
 from app.services.car_tracking import CarTracker, unique_masks
 from app.services.incidents import INCIDENT_DIR, IncidentDetector, evidence_frame, write_incident
 from app.services.track_consensus import consensus_track_polygon, reference_frame_indices
+from app.services.track_stabilization import TrackStabilizer
 
 router = APIRouter()
 
@@ -166,7 +167,7 @@ def _make_static_track_payload(payload: dict[str, Any], frame_index: int, dynami
 def _select_static_track_payload(
     sampled_frames: list[SampledFrame],
     reference_frames: int,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, TrackStabilizer | None]:
     """Choose an anchor with few obstructions and combine compatible masks."""
     candidates: list[dict[str, Any]] = []
 
@@ -193,12 +194,21 @@ def _select_static_track_payload(
         candidates.append(_make_static_track_payload(track_payload, frame_index, dynamic_count))
 
     if not candidates:
-        return None
+        return None, None
     candidates.sort(key=lambda mask: (mask["reference_dynamic_masks"], -mask["reference_area"]))
     anchor = candidates[0]
-    consensus = consensus_track_polygon(
-        anchor["points"], [candidate["points"] for candidate in candidates[1:]],
-    )
+    frames = dict(sampled_frames)
+    stabilizer = TrackStabilizer(frames[anchor["source_frame_index"]], anchor["points"])
+    alternatives = []
+    for candidate in candidates[1:]:
+        if not stabilizer.available:
+            alternatives.append(candidate["points"])
+            continue
+        transform = stabilizer.estimate(frames[candidate["source_frame_index"]])
+        if transform is not None:
+            inverse = cv2.invertAffineTransform(transform)
+            alternatives.append(stabilizer.transform(candidate["points"], inverse))
+    consensus = consensus_track_polygon(anchor["points"], alternatives)
     if consensus is not None:
         points, count = consensus
         anchor.update(
@@ -206,7 +216,7 @@ def _select_static_track_payload(
             yolo_segmentation=_to_yolo_segmentation(0, points), reference_samples=count,
             reference_area=round(_polygon_area(points), 6),
         )
-    return anchor
+    return anchor, stabilizer
 
 
 def _mask_to_violation_regions(
@@ -525,6 +535,9 @@ def infer_video(
             frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
             incident_detector = IncidentDetector(min(fps, sample_fps))
             static_track = calibration.track_mask() if calibration else None
+            stabilizer = None
+            if calibration and static_track and (reference := calibration.reference_frame()) is not None:
+                stabilizer = TrackStabilizer(reference, static_track["points"])
             if static_track_mode and calibration is None:
                 reference_count = min(track_reference_frames, max_frames)
                 budget = min(reference_count, 8)
@@ -543,13 +556,14 @@ def infer_video(
                     stride = max(1, math.ceil(window / budget))
                     candidates = [(i, frame) for i, _, frame in islice(frames, 0, window, stride)]
                     frames.close()
-                static_track = _select_static_track_payload(candidates, len(candidates))
+                static_track, stabilizer = _select_static_track_payload(candidates, len(candidates))
                 del candidates
                 capture.release()
                 capture = cv2.VideoCapture(source)
 
             results = []
             cached_masks = None
+            stabilized_frames = 0
             truncated = False
             for index, (source_index, timestamp, frame) in enumerate(_sample_video_frames(capture, fps, sample_fps)):
                 if index == max_frames:
@@ -559,8 +573,17 @@ def infer_video(
                     if calibration and not calibration.matches_frame(frame.shape[1], frame.shape[0]):
                         raise HTTPException(status_code=422, detail="Пропорции кадра отличаются от сохранённой границы камеры")
                     cached_masks = detector.track_masks(frame.shape[:2], static_track["points"])
+                frame_track, frame_masks = static_track, cached_masks
+                if static_track and stabilizer is not None and source_index != static_track.get("source_frame_index"):
+                    base_points = static_track["points"]
+                    adjusted = stabilizer.adjust(frame, base_points)
+                    if adjusted is not base_points:
+                        frame_track = {**static_track, "points": adjusted,
+                                       "yolo_segmentation": _to_yolo_segmentation(0, adjusted)}
+                        frame_masks = detector.track_masks(frame.shape[:2], adjusted)
+                        stabilized_frames += 1
                 analysis, masks, wheels, points = _analyze_frame(
-                    frame, source_index, detector, static_track, cached_masks, tracker, timestamp,
+                    frame, source_index, detector, frame_track, frame_masks, tracker, timestamp,
                     annotate=not compact,
                 )
                 for incident in incident_detector.update(analysis.cars, source_index, timestamp):
@@ -600,6 +623,7 @@ def infer_video(
         static_track_enabled=bool(static_track),
         static_track_reference_frame=static_track.get("source_frame_index") if static_track else None,
         static_track_reference_samples=static_track.get("reference_samples") if static_track else None,
+        stabilized_frames=stabilized_frames,
         static_track_reason=reason, calibration_camera_id=camera_id if calibration else None,
         results=results, incidents=incidents,
     )
