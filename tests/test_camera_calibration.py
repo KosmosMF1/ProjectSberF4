@@ -82,6 +82,16 @@ class CameraCalibrationTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 outline_from_mask(mask)
 
+    def test_import_uses_main_exterior_when_detected_mask_has_holes_and_islands(self):
+        mask = np.zeros((121, 201), dtype=np.uint8)
+        mask[30:101, 20:141] = 255
+        mask[45:65, 45:65] = 0
+        mask[35:80, 160:181] = 255
+        points = outline_from_mask(mask, main_contour=True)
+        polygon = np.rint(np.asarray(points) * [200, 120]).astype(np.int32)
+        self.assertGreater(cv2.pointPolygonTest(polygon, (55, 55), False), 0)
+        self.assertLess(cv2.pointPolygonTest(polygon, (170, 55), False), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

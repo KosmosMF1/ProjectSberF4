@@ -91,18 +91,20 @@ class CameraCalibration(BaseModel):
         }
 
 
-def outline_from_mask(mask: np.ndarray) -> list[Point]:
+def outline_from_mask(mask: np.ndarray, *, main_contour: bool = False) -> list[Point]:
     """Convert a painted region into an editable camera boundary."""
     height, width = mask.shape
-    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    mode = cv2.RETR_EXTERNAL if main_contour else cv2.RETR_LIST
+    contours, _ = cv2.findContours(mask, mode, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         raise ValueError("Закрась область трассы перед сохранением")
-    if len(contours) != 1:
+    if not main_contour and len(contours) != 1:
         raise ValueError("Закрашенная зона должна быть цельной. Соедини участки кистью и закрась отверстия.")
 
+    contour = max(contours, key=cv2.contourArea)
     scale = np.array([max(width - 1, 1), max(height - 1, 1)])
     for tolerance in (0.8, 1.5, 2.5, 4.0):
-        points = cv2.approxPolyDP(contours[0], tolerance, True).reshape(-1, 2) / scale
+        points = cv2.approxPolyDP(contour, tolerance, True).reshape(-1, 2) / scale
         if not 3 <= len(points) <= 256:
             continue
         try:

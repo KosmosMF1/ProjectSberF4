@@ -391,7 +391,7 @@ def put_camera_calibration(
 
 
 @router.post("/calibration/outline")
-def calibration_outline(mask: UploadFile = File(...)) -> dict:
+def calibration_outline(mask: UploadFile = File(...), main_contour: bool = Form(False)) -> dict:
     payload = _read_upload_bytes(mask, MAX_UPLOAD_BYTES)
     if len(payload) < 24 or not payload.startswith(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"):
         raise HTTPException(status_code=400, detail="Ожидается PNG с закрашенной областью")
@@ -405,7 +405,7 @@ def calibration_outline(mask: UploadFile = File(...)) -> dict:
     channel = 3 if pixels.shape[2] == 4 else 1
     binary = (pixels[:, :, channel] > 127).astype(np.uint8)
     try:
-        points = outline_from_mask(binary)
+        points = outline_from_mask(binary, main_contour=main_contour)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"points": points}

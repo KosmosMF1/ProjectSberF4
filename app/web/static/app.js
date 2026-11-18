@@ -24,8 +24,10 @@ const playbackState = document.getElementById("playbackState");
 
 let isProcessing = false;
 let currentVideoResult = null;
+let currentVideoFile = null;
 let currentVideoFrames = [];
 let currentVideoFrameIndex = 0;
+let displayedVideoFrame = null;
 let playbackTimer = null;
 
 processBtn.disabled = true;
@@ -132,7 +134,9 @@ async function processImage(imageFile) {
     resetVideoViewer();
     setStatus("Отправка изображения на backend", "busy");
     const result = await sendFrame(imageFile, 0);
-    await drawFrameAndMasks(result);
+    const image = await loadImage(result.frame_data_url);
+    if (mediaInput.files?.[0] !== imageFile) return;
+    drawFrameAndMasks(result, image);
     frameCounter.textContent = "Кадр: 0";
     responseBox.textContent = formatResponse(result);
     const doneStatus = result.violation_detected
@@ -159,16 +163,16 @@ async function processVideo(videoFile) {
         throw new Error("Укажите ID камеры латиницей, цифрами, через дефис или подчёркивание");
     }
     const result = await sendVideo(videoFile, sampleFps, staticTrackMode, referenceFrames);
+    if (mediaInput.files?.[0] !== videoFile) return;
     const frames = result.results || [];
     if (!frames.length) {
         throw new Error("Backend не вернул обработанные кадры");
     }
 
-    currentVideoResult = result;
-    currentVideoFrames = frames;
-    currentVideoFrameIndex = 0;
+    currentVideoFile = videoFile;
     setupVideoViewer(result, frames);
     await renderVideoFrame(0);
+    if (currentVideoResult !== result) return;
 
     const incidents = result.incidents || [];
     renderIncidents(incidents);
@@ -279,7 +283,9 @@ function setupVideoViewer(videoResult, frames) {
 
 function resetVideoViewer() {
     currentVideoResult = null;
+    currentVideoFile = null;
     currentVideoFrames = [];
+    displayedVideoFrame = null;
     incidentPanel.hidden = true;
     incidentList.replaceChildren();
     currentVideoFrameIndex = 0;
@@ -308,7 +314,10 @@ async function renderVideoFrame(index) {
     const frameResult = currentVideoFrames[safeIndex];
     currentVideoFrameIndex = safeIndex;
 
-    await drawFrameAndMasks(frameResult);
+    const image = await loadImage(frameResult.frame_data_url);
+    if (frameResult !== currentVideoFrames[currentVideoFrameIndex]) return;
+    drawFrameAndMasks(frameResult, image);
+    displayedVideoFrame = frameResult;
 
     const total = currentVideoFrames.length;
     const sourceIndex = frameResult.source_frame_index ?? frameResult.frame_index;
@@ -378,9 +387,7 @@ function updatePlaybackControls() {
     }
 }
 
-async function drawFrameAndMasks(result) {
-    const image = await loadImage(result.frame_data_url);
-
+function drawFrameAndMasks(result, image) {
     configurePreviewCanvas(result.frame_width, result.frame_height);
 
     previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);

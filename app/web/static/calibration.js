@@ -175,7 +175,10 @@
     }
 
     function snapshot() {
-        return { points: draft.points, strokes: draft.strokes, tool: draft.tool };
+        return {
+            points: draft.points, strokes: draft.strokes, tool: draft.tool,
+            outlinePending: draft.outlinePending,
+        };
     }
 
     function remember(previous = snapshot()) {
@@ -206,15 +209,16 @@
         return closest;
     }
 
-    async function applyBrushEdits() {
+    async function prepareOutline(mainContour = false) {
         const active = draft;
-        if (!active.strokes.length) return;
+        if (!active.outlinePending && !active.strokes.length) return;
         renderMask();
         const png = await new Promise(resolve => maskCanvas.toBlob(resolve, "image/png"));
         if (active !== draft) return;
         if (!png) throw new Error("Не удалось подготовить закрашенную область.");
         const request = new FormData();
         request.append("mask", png, "track-mask.png");
+        if (mainContour) request.append("main_contour", "true");
         const response = await fetch("/api/calibration/outline", {
             method: "POST",
             body: request,
@@ -225,6 +229,7 @@
         if (active !== draft) return;
         active.points = outline.points;
         active.strokes = [];
+        active.outlinePending = false;
         draw();
     }
 
@@ -240,6 +245,10 @@
         });
         if (!response.ok) throw new Error(await readBackendError(response));
         const frame = await response.json();
+        await showPreview(active, frame);
+    }
+
+    async function showPreview(active, frame, message = "") {
         const image = await loadImage(frame.frame_data_url);
         if (draft !== active || active.controller.signal.aborted) return;
 
@@ -251,6 +260,7 @@
             active.points = [];
             active.strokes = [];
             active.history = [];
+            active.outlinePending = false;
         }
         draft.frame = frame;
         draft.image = image;
@@ -261,12 +271,12 @@
         tools.hidden = false;
         if (firstPreview) setZoom(1);
         frameTime.textContent = `Кадр на ${frame.timestamp.toFixed(2)} с`;
-        if (frame.last_timestamp !== null) {
+        if (Number.isFinite(frame.last_timestamp)) {
             time.max = String(frame.last_timestamp);
         }
         status.textContent = incompatible
             ? "Пропорции кадра отличаются. Разметь границу для этого кадра заново."
-            : firstPreview && active.profile ? "Показана сохранённая граница." : "";
+            : message || (firstPreview && active.profile ? "Показана сохранённая граница." : "");
         draw();
     }
 
@@ -297,10 +307,13 @@
             setStatus("Укажите ID камеры для сохранения границы", "error");
             return;
         }
+        stopPlayback();
+        const processedFrame = currentVideoFile === file ? displayedVideoFrame : null;
+        const processedMask = processedFrame?.masks?.find(mask => mask.class_id === 0 && mask.points?.length >= 3);
         draft = {
             file, cameraId, path: `/api/cameras/${encodeURIComponent(cameraId)}/calibration`,
             controller: new AbortController(), tool: "points",
-            points: [], strokes: [], history: [], frame: null, image: null,
+            points: [], strokes: [], history: [], frame: null, image: null, outlinePending: false,
         };
         title.textContent = `Граница трассы · ${cameraId}`;
         viewport.hidden = true;
@@ -312,6 +325,23 @@
         dialog.showModal();
         void run(async () => {
             const active = draft;
+            if (processedMask && Number.isFinite(processedFrame.timestamp)) {
+                const { source_fps, total_frames_estimate } = currentVideoResult;
+                const lastTimestamp = total_frames_estimate > 0
+                    ? (total_frames_estimate - 1) / (source_fps ?? 30)
+                    : null;
+                active.points = processedMask.points.map(point => [...point]);
+                active.tool = "paint";
+                active.outlinePending = processedMask.model_name !== "track_camera_calibration"
+                    || active.points.some(point => point.some(value => value < 0 || value > 1));
+                time.value = String(processedFrame.timestamp);
+                await showPreview(active, { ...processedFrame, last_timestamp: lastTimestamp },
+                                  "Подготавливается контур маски…");
+                if (draft !== active) return;
+                await prepareOutline(true);
+                if (draft === active) status.textContent = "Основной контур маски из результата обработки.";
+                return;
+            }
             const response = await fetch(active.path, { signal: active.controller.signal });
             let profile = null;
             if (response.ok) profile = await response.json();
@@ -339,10 +369,10 @@
                 refreshControls();
                 draw();
             };
-            if (tool === "points" && draft.strokes.length) {
+            if (tool === "points" && (draft.outlinePending || draft.strokes.length)) {
                 const active = draft;
                 void run(async () => {
-                    await applyBrushEdits();
+                    await prepareOutline();
                     if (active === draft) select();
                 }, "Строится контур…");
             } else {
@@ -449,6 +479,7 @@
         remember();
         draft.points = [];
         draft.strokes = [];
+        draft.outlinePending = false;
         draw();
         refreshControls();
     });
@@ -456,7 +487,7 @@
     saveBtn.addEventListener("click", () => {
         void run(async () => {
             const active = draft;
-            await applyBrushEdits();
+            await prepareOutline();
             if (active !== draft) return;
             const { frame_width, frame_height, frame_data_url } = active.frame;
             const response = await fetch(active.path, {
